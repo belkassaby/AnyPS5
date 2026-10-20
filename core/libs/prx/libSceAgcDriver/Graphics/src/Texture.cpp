@@ -2050,7 +2050,12 @@ bool StorageTexture::Refresh() {
     // way: a thick (3D) storage image whose memory changed only through another image's flush (a
     // transient heap block shared with cube maps) keeps its content instead of uploading it.
     static const bool volumeDiscardDefault = std::getenv("APS5_VOLUME_ALIAS_DISCARD") != nullptr;
-    const bool aliasSite = std::string_view(g_refreshSite) == "render-target" ? LiveFlag("rt_alias_discard", aliasDiscardDefault) : geometry.thick && (std::string_view(g_refreshSite) == "storage" || std::string_view(g_refreshSite) == "other") && LiveFlag("volume_alias_discard", volumeDiscardDefault);
+    // Live `storage_alias_discard` (APS5_STORAGE_ALIAS_DISCARD=1), experimental and inexact the same
+    // way, for the thin (2D) storage images of the same transient blocks (PPSA01317 hands one block
+    // to 1920x1080, 1920x2160, 666x524 and 512x256 targets of different formats every frame).
+    static const bool storageDiscardDefault = std::getenv("APS5_STORAGE_ALIAS_DISCARD") != nullptr;
+    const bool storageSite = std::string_view(g_refreshSite) == "storage" || std::string_view(g_refreshSite) == "other";
+    const bool aliasSite = std::string_view(g_refreshSite) == "render-target" ? LiveFlag("rt_alias_discard", aliasDiscardDefault) : storageSite && (geometry.thick ? LiveFlag("volume_alias_discard", volumeDiscardDefault) : LiveFlag("storage_alias_discard", storageDiscardDefault));
     const bool aliasDiscard = flushed && !keysChanged && !cpuWrote && generation != 0 && keys == DccKeys::Uncompressed && aliasSite;
     static const bool traceVolume = std::getenv("APS5_TRACE_VOLUME_DISCARD") != nullptr;
     if (traceVolume && geometry.thick) {

@@ -37,6 +37,8 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -2027,6 +2029,12 @@ std::uint32_t BarrierSkipMask() {
 
 }
 
+namespace {
+// APS5_TRACE_PASS_ENDS: the return address of the last Commands/OpenBatch call on this thread,
+// the site a pass end inside it is charged to (the [pass-end-sites] lines).
+thread_local const void* passEndCaller = nullptr;
+}
+
 void Recorder::prepareCommands() {
     ForkQuiesce("commands");
     ensureOpen();
@@ -2039,7 +2047,9 @@ void Recorder::prepareCommands() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    if (passEndCaller == nullptr) passEndCaller = __builtin_return_address(0);
     prepareCommands();
+    passEndCaller = nullptr;
     if (open->skipMask != 0) untrackedUse();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -2047,15 +2057,19 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
 }
 
 VkCommandBuffer Recorder::OpenBatch() {
+    passEndCaller = __builtin_return_address(0);
     prepareCommands();
+    passEndCaller = nullptr;
     open->coveredAccess = 0;
     return open->commands;
 }
 
 VkCommandBuffer Recorder::Commands(CommandClass which, const Access& access, bool& elided, VkAccessFlags* coveredAccess) {
     elided = false;
+    passEndCaller = __builtin_return_address(0);
     if (!BarrierTracking()) return Commands(coveredAccess);
     prepareCommands();
+    passEndCaller = nullptr;
     elided = NoteAccess(which, access);
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -2194,10 +2208,92 @@ Recorder::PassEndCauseScope::~PassEndCauseScope() {
     passEndCauseHint = previous;
 }
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long framesToSkip, unsigned long framesToCapture, void** backTrace, unsigned long* backTraceHash);
+extern "C" __declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long flags, const char* name, void** module);
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void* module, char* name, unsigned long size);
+#endif
+
+namespace {
+// APS5_TRACE_PASS_ENDS=1: the call stacks that end render passes for the draw-build cause (and the
+// other draw and committer causes), counted per distinct stack and printed every 10 s as
+// [pass-end-sites] with absolute return addresses. `self` is this function's own address, so the
+// addresses map to the library's symbols (nm) by the difference to its symbol address.
+struct PassEndSites {
+    static constexpr std::size_t Depth = 7;
+    using Stack = std::array<void*, Depth>;
+    struct StackHash {
+        std::size_t operator()(const Stack& stack) const {
+            std::size_t hash = 0;
+            for (auto* frame : stack) hash = hash * 1000003u ^ reinterpret_cast<std::uintptr_t>(frame);
+            return hash;
+        }
+    };
+    std::mutex mutex;
+    std::unordered_map<Stack, std::array<std::uint64_t, Recorder::PassEndCauseCount>, StackHash> counts;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+bool TracePassEnds() {
+    static const bool on = std::getenv("APS5_TRACE_PASS_ENDS") != nullptr;
+    return on;
+}
+
+void notePassEndSite(Recorder::PassEndCause cause, const void* self) {
+#ifdef _WIN32
+    static PassEndSites sites;
+    // The Commands/OpenBatch caller first (the unwinder rarely gets past this library's frames).
+    PassEndSites::Stack stack{};
+    stack[0] = const_cast<void*>(passEndCaller);
+    RtlCaptureStackBackTrace(1, static_cast<unsigned long>(PassEndSites::Depth - 1), stack.data() + 1, nullptr);
+    std::lock_guard lock(sites.mutex);
+    ++sites.counts[stack][static_cast<std::size_t>(cause)];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sites.reported < std::chrono::seconds(10)) return;
+    sites.reported = now;
+    std::vector<std::pair<std::uint64_t, const PassEndSites::Stack*>> ranked;
+    std::vector<std::pair<std::size_t, std::uint64_t>> top;
+    for (const auto& [frames, byCause] : sites.counts) {
+        std::uint64_t total = 0;
+        for (auto value : byCause) total += value;
+        ranked.emplace_back(total, &frames);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::fprintf(stderr, "[pass-end-sites] (10 s) %zu stacks; endOpenRenderPass at %p\n", ranked.size(), self);
+    for (std::size_t i = 0; i < ranked.size() && i < 12; ++i) {
+        const auto& byCause = sites.counts[*ranked[i].second];
+        std::fprintf(stderr, "[pass-end-sites] %llu:", static_cast<unsigned long long>(ranked[i].first));
+        for (std::size_t c = 0; c < byCause.size(); ++c) {
+            if (byCause[c] != 0) std::fprintf(stderr, " %s=%llu", Recorder::PassEndCauseName(static_cast<Recorder::PassEndCause>(c)), static_cast<unsigned long long>(byCause[c]));
+        }
+        std::fprintf(stderr, " |");
+        for (auto* frame : *ranked[i].second) {
+            if (frame == nullptr) {
+                std::fprintf(stderr, " -");
+                continue;
+            }
+            // module!offset: offsets map to `nm` addresses minus the module's ImageBase.
+            void* module = nullptr;
+            char path[260] = "?";
+            if (GetModuleHandleExA(0x4u | 0x2u, static_cast<const char*>(frame), &module) != 0) GetModuleFileNameA(module, path, sizeof(path));
+            const char* name = std::strrchr(path, '\\');
+            std::fprintf(stderr, " %s+0x%llx", name != nullptr ? name + 1 : path, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frame) - reinterpret_cast<std::uintptr_t>(module)));
+        }
+        std::fprintf(stderr, "\n");
+    }
+    sites.counts.clear();
+#else
+    (void)cause;
+    (void)self;
+#endif
+}
+}
+
 void Recorder::endOpenRenderPass(PassEndCause cause, SubmitReason submitReason) {
     if (cause == PassEndCause::Auto) cause = passEndCauseHint;
     if (cause == PassEndCause::Auto) cause = committerThread ? PassEndCause::CommitterOther : GuestMemory::GpuLockThreadTag() != 0xffffffffu ? PassEndCause::QueueWorker : PassEndCause::OtherThread;
     passEndCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+    if (TracePassEnds() && cause != PassEndCause::Submit) notePassEndSite(cause, reinterpret_cast<const void*>(&notePassEndSite));
     if (cause == PassEndCause::Submit) passEndSubmits[static_cast<std::size_t>(submitReason)].fetch_add(1, std::memory_order_relaxed);
     if (!committerThread) passEndsByOtherThreads.fetch_add(1, std::memory_order_release);
     ++passGeneration;
