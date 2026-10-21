@@ -300,10 +300,11 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             graphics();
             size(4);
             const auto operation = (packet[1] >> 16u) & 7u;
-            require(operation != 1 && operation != 2, "GPU query predication is not implemented");
-            require(operation == 0 || operation == 3 || operation == 4, "invalid predication operation");
+            require(operation <= 4, "invalid predication operation");
             require((packet[1] & ~0x71100u) == 0, "unsupported SET_PREDICATION bits");
-            if (operation != 0) require(address(packet[2], packet[3]) != 0 && (packet[2] & 0xfu) == 0, "unaligned predication address");
+            // ZPASS (1) and PRIMCOUNT (2) results are never read (PredicationPasses), so their
+            // address is not checked.
+            if (operation >= 3) require(address(packet[2], packet[3]) != 0 && (packet[2] & 0xfu) == 0, "unaligned predication address");
             break;
         }
         case 0x3f: size(4); break;
@@ -543,6 +544,11 @@ std::size_t ConditionalWords(std::span<const std::uint32_t> packet) {
 bool PredicationPasses(const QueueState& queue) {
     const auto& predication = queue.predication;
     if (predication.operation == 0) return true;
+    // GPU query predication (ZPASS occlusion, PRIMCOUNT streamout overflow) is not evaluated:
+    // every query reads as visible and not overflowed, so draw-if-visible packets run and
+    // draw-if-not-visible packets are skipped. Skipping the occlusion cull only costs GPU time
+    // (PPSA01317's Menu Book reward screen predicates its draws on occlusion queries).
+    if (predication.operation == 1 || predication.operation == 2) return predication.executeWhenSet;
     const std::size_t bytes = predication.operation == 3 ? 8 : 4;
     std::uint64_t value = 0;
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);

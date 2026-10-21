@@ -598,8 +598,15 @@ void testPredication() {
     execute(state, setPredication(0, false, nullptr));
     check(state.predication.operation == 0 && AgcDriver::Pm4::PredicationPasses(state), "clear must end predication");
 
-    expectFailure([&] { AgcDriver::Pm4::Validate(setPredication(1, true, &flag[0]), 0); }, "query predication");
-    expectFailure([&] { AgcDriver::Pm4::Validate(setPredication(2, true, &flag[0]), 0); }, "query predication");
+    for (const std::uint32_t operation : {1u, 2u}) {
+        AgcDriver::Pm4::Validate(setPredication(operation, true, &flag[0]), 0);
+        flag[0] = 0;
+        execute(state, setPredication(operation, true, &flag[0]));
+        check(AgcDriver::Pm4::PredicationPasses(state), "query predication must run draw-visible packets");
+        execute(state, setPredication(operation, false, &flag[0]));
+        check(!AgcDriver::Pm4::PredicationPasses(state), "query predication must skip draw-not-visible packets");
+    }
+    execute(state, setPredication(0, false, nullptr));
     expectFailure([&] { AgcDriver::Pm4::Validate(setPredication(5, true, &flag[0]), 0); }, "invalid predication operation");
     expectFailure([&] { AgcDriver::Pm4::Validate(setPredication(3, true, &flag[0]), 0x20); }, "compute queue");
     expectFailure([&] { AgcDriver::Pm4::Validate(setPredication(3, true, nullptr), 0); }, "unaligned predication address");
