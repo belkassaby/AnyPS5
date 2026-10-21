@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AddressLedger.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PendingUnits.hpp"
@@ -2256,6 +2257,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
             recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "upload", 1);
+            if (GpuCheckpoints::Active().load(std::memory_order_relaxed)) {
+                char text[160];
+                std::snprintf(text, sizeof(text), "detile upload %ux%u fmt%u tile%d mips %u layers %u, import 0x%llx+0x%llx", descriptor.width, descriptor.height, descriptor.format, static_cast<int>(descriptor.tileMode), descriptor.mipCount, arrayLayers, static_cast<unsigned long long>(import->base), static_cast<unsigned long long>(import->bytes));
+                GpuCheckpoints::Set(context, commands, "storage-upload detile (surface, bytes, linear)", descriptor.baseAddress, guestBytes, linearBytes, text);
+            }
             recorder->Keep(linear, linear->Size());
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -2615,6 +2621,11 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{tracked, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "upload-windows", static_cast<std::uint32_t>(runs.size()));
+        if (GpuCheckpoints::Active().load(std::memory_order_relaxed)) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "window upload %ux%u fmt%u tile%d mips %u, %zu runs %zu sources", descriptor.width, descriptor.height, descriptor.format, static_cast<int>(descriptor.tileMode), descriptor.mipCount, runs.size(), sources.size());
+            GpuCheckpoints::Set(context, commands, "storage-upload windows (surface, bytes, linear)", descriptor.baseAddress, guestBytes, linear->Size(), text);
+        }
         recorder->Keep(linear, linear->Size());
         for (const auto& source : sources) {
             if (source.slab != nullptr) recorder->Keep(source.slab);
@@ -4542,6 +4553,65 @@ void StorageTexture::recordBorrowCopy(StorageTexture& source, const std::vector<
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
     }
+    // APS5_GPU_CHECKPOINTS: the copy names both surfaces, so a fault inside it names the alias.
+    {
+        char text[160];
+        std::snprintf(text, sizeof(text), "borrow copy %ux%u fmt%u <- 0x%llx %ux%u fmt%u, %zu regions", descriptor.width, descriptor.height, descriptor.format, static_cast<unsigned long long>(source.descriptor.baseAddress), source.descriptor.width, source.descriptor.height, source.descriptor.format, regions.size());
+        GpuCheckpoints::Set(context, commands, "storage-upload borrow (dst, bytes, regions)", descriptor.baseAddress, bytes, regions.size(), text);
+    }
+    // The regions come from this image's unit windows; a source of another shape over the same
+    // memory (a shorter or narrower target the transient pool handed out before) can end inside
+    // them. A copy region outside either image is undefined behaviour on the device: on NVIDIA it
+    // faults the GPU (VK_ERROR_DEVICE_LOST, PPSA01317's World Map with a progressed save). Each
+    // region is clipped to what both images hold; one with nothing left, or with a mip or layer
+    // one image lacks, is left out. The rows past the source's end keep this image's content, as
+    // the source holds none for them. APS5_TRACE_BORROW_CLIP=1 logs the clipped regions.
+    std::vector<VkImageCopy> fitting;
+    fitting.reserve(regions.size());
+    {
+        struct Room {
+            bool exists;
+            std::uint32_t x, y, z;
+        };
+        const auto room = [](const StorageTexture& surface, const VkImageSubresourceLayers& layers, const VkOffset3D& offset) {
+            if (layers.mipLevel >= surface.descriptor.mipCount || layers.baseArrayLayer + layers.layerCount > surface.geometry.imageLayers || offset.x < 0 || offset.y < 0 || offset.z < 0) return Room{false, 0, 0, 0};
+            const auto width = std::max(surface.descriptor.width >> layers.mipLevel, 1u);
+            const auto height = std::max(surface.descriptor.height >> layers.mipLevel, 1u);
+            const auto depth = std::max(surface.geometry.imageDepth >> layers.mipLevel, 1u);
+            const auto left = [](std::uint32_t size, std::int32_t at) { return static_cast<std::uint32_t>(at) < size ? size - static_cast<std::uint32_t>(at) : 0u; };
+            return Room{true, left(width, offset.x), left(height, offset.y), left(depth, offset.z)};
+        };
+        // Block-compressed formats copy whole 4x4 blocks except at an image's edge.
+        const bool compressed = storageFormat >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && storageFormat <= VK_FORMAT_BC7_SRGB_BLOCK;
+        static const bool trace = std::getenv("APS5_TRACE_BORROW_CLIP") != nullptr;
+        static std::atomic<int> traced{0};
+        static std::atomic<std::uint64_t> clipped{0}, dropped{0};
+        for (const auto& region : regions) {
+            const auto from = room(source, region.srcSubresource, region.srcOffset);
+            const auto to = room(*this, region.dstSubresource, region.dstOffset);
+            VkImageCopy kept = region;
+            kept.extent.width = std::min({region.extent.width, from.x, to.x});
+            kept.extent.height = std::min({region.extent.height, from.y, to.y});
+            kept.extent.depth = std::min({region.extent.depth, from.z, to.z});
+            const bool changed = kept.extent.width != region.extent.width || kept.extent.height != region.extent.height || kept.extent.depth != region.extent.depth;
+            const auto endsMidBlock = [&](std::uint32_t extent, std::uint32_t destinationRoom) { return extent % 4u != 0 && extent != destinationRoom; };
+            const bool keep = from.exists && to.exists && kept.extent.width != 0 && kept.extent.height != 0 && kept.extent.depth != 0 && !(compressed && changed && (endsMidBlock(kept.extent.width, to.x) || endsMidBlock(kept.extent.height, to.y)));
+            if (keep) fitting.push_back(kept);
+            if (!changed && keep) continue;
+            (keep ? clipped : dropped).fetch_add(1, std::memory_order_relaxed);
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+                std::fprintf(stderr, "[borrow-copy] %s: dst 0x%llx %ux%u fmt%u mips %u layers %u depth %u <- src 0x%llx %ux%u fmt%u mips %u layers %u depth %u; region src mip %u layer %u+%u off %d,%d,%d extent %ux%ux%u -> %ux%ux%u\n", keep ? "clipped" : "dropped", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, geometry.imageLayers, geometry.imageDepth, static_cast<unsigned long long>(source.descriptor.baseAddress), source.descriptor.width, source.descriptor.height, source.descriptor.format, source.descriptor.mipCount, source.geometry.imageLayers, source.geometry.imageDepth, region.srcSubresource.mipLevel, region.srcSubresource.baseArrayLayer, region.srcSubresource.layerCount, region.srcOffset.x, region.srcOffset.y, region.srcOffset.z, region.extent.width, region.extent.height, region.extent.depth, kept.extent.width, kept.extent.height, kept.extent.depth);
+                std::fflush(stderr);
+            }
+        }
+        // One line every 10 s while borrows clip, so a run shows the fix at work without tracing.
+        static std::atomic<std::int64_t> reported{0};
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = reported.load(std::memory_order_relaxed);
+        if ((clipped.load(std::memory_order_relaxed) | dropped.load(std::memory_order_relaxed)) != 0 && now - last > 10'000'000'000ll && reported.compare_exchange_strong(last, now)) {
+            std::fprintf(stderr, "[borrow-copy] (10 s) regions clipped to both images %llu, dropped %llu\n", static_cast<unsigned long long>(clipped.exchange(0)), static_cast<unsigned long long>(dropped.exchange(0)));
+        }
+    }
     VkImageMemoryBarrier barriers[2]{};
     for (auto& barrier : barriers) {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -4559,7 +4629,7 @@ void StorageTexture::recordBorrowCopy(StorageTexture& source, const std::vector<
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[1].image = image;
     if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
-    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (!fitting.empty()) context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(fitting.size()), fitting.data());
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;

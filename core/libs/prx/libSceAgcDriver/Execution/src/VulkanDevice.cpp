@@ -141,6 +141,33 @@ void reportDeviceFault() {
     std::fflush(stderr);
 }
 
+// With APS5_DEVICE_FAULT: a device loss the driver never reports to the title (its fence and
+// semaphore waits keep waiting, the window freezes) still gets the fault and checkpoint report once
+// no frame has been presented for 10 s after the first one.
+std::atomic<long long> lastPresentNs{0};
+
+long long steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void startHangWatchdog() {
+    if (std::getenv("APS5_DEVICE_FAULT") == nullptr) return;
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const auto last = lastPresentNs.load(std::memory_order_relaxed);
+                if (last == 0 || steadyNowNs() - last < 10'000'000'000ll) continue;
+                std::fprintf(stderr, "[hang-watchdog] no frame presented for %.1f s: reporting the device fault and the GPU checkpoints\n", static_cast<double>(steadyNowNs() - last) / 1e9);
+                std::fflush(stderr);
+                reportDeviceFault();
+                return;
+            }
+        }).detach();
+    });
+}
+
 void check(VkResult result, const char* operation) {
     if (result == VK_ERROR_DEVICE_LOST) reportDeviceFault();
     if (result != VK_SUCCESS) {
@@ -1492,6 +1519,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     Graphics::NvPerf::Initialize(state->instance, selected, state->device, state->queue, family, state->instanceProc, state->deviceProc);
     faultQueue = state->queue;
     faultDeviceProc = state->deviceProc;
+    startHangWatchdog();
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -3247,6 +3275,7 @@ void VulkanDevice::QueuePresent() {
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
+    lastPresentNs.store(steadyNowNs(), std::memory_order_relaxed);
     timing.Mark("queue_present");
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
 }
