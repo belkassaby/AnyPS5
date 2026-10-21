@@ -50,6 +50,13 @@ bool Same(const Affine& left, const Affine& right) {
     return !left.dynamic && !right.dynamic && left == right;
 }
 
+std::optional<Affine> CommonMultiple(const Affine& left, const Affine& right) {
+    if (left.vertex != right.vertex || left.relative != right.relative || left.constant != right.constant) return std::nullopt;
+    const auto multiple = std::gcd(left.dynamic ? left.dynamicScale : 0, right.dynamic ? right.dynamicScale : 0);
+    if (multiple == 0) return std::nullopt;
+    return Affine{left.vertex, left.relative, left.constant, true, multiple, nullptr};
+}
+
 [[noreturn]] void Fail(const char* reason, std::uint32_t pc) {
     char text[256];
     std::snprintf(text, sizeof(text), "tessellation lowering: %s at pc 0x%x", reason, pc);
@@ -64,6 +71,11 @@ bool IsImmediate(const IrValue* raw, std::uint32_t expected) {
 bool IsBase(const IrValue* raw, TessellationBaseKind kind) {
     const IrValue* value = raw->Resolve();
     return value->Opcode() == IrOpcode::TessellationBase && IsImmediate(value->Argument(0), static_cast<std::uint32_t>(kind));
+}
+
+bool OwnPatchRead(const IrValue* value) {
+    if (SharedAccessOf(value->Opcode()) == SharedAccess::Read) return true;
+    return BufferAccessOf(value->Opcode()) == BufferAccess::Read && value->ArgumentCount() > 3u && IsBase(value->Argument(3), TessellationBaseKind::OffChip);
 }
 
 std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {
@@ -327,6 +339,7 @@ private:
                 pending.push_back(value->Argument(1)->Resolve());
                 continue;
             }
+            if (value != start && OwnPatchRead(value)) continue;
             for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
                 if (IrValue* argument = value->Argument(index)) pending.push_back(argument->Resolve());
             }
@@ -395,7 +408,7 @@ private:
         case IrOpcode::ShiftLeftLogical32: {
             const auto lhs = argument(0);
             const auto shift = scalar(1);
-            if (!lhs || !shift || *shift >= 31) return std::nullopt;
+            if (!lhs || !shift || *shift < 0 || *shift >= 31) return std::nullopt;
             return scale(*lhs, 1ll << *shift);
         }
         case IrOpcode::ShiftRightLogical32: {
@@ -423,7 +436,7 @@ private:
             const auto source = argument(0);
             const auto offset = scalar(1);
             const auto count = scalar(2);
-            if (!source || !offset || !count) return std::nullopt;
+            if (!source || !offset || !count || *count < 0) return std::nullopt;
             if (*count == 0) return Affine{};
             const auto shifted = shiftRight(*source, *offset);
             if (!shifted || *count >= 32) return shifted;
@@ -433,18 +446,22 @@ private:
             if (active != nullptr && Implies(active, value->Argument(0))) return argument(1);
             const auto lhs = argument(1);
             const auto rhs = argument(2);
-            return lhs && rhs && Same(*lhs, *rhs) ? lhs : std::nullopt;
+            if (!lhs || !rhs) return std::nullopt;
+            if (Same(*lhs, *rhs)) return lhs;
+            return dynamic ? CommonMultiple(*lhs, *rhs) : std::nullopt;
         }
         default:
             break;
         }
         if (!value->IsPhi() || value->ArgumentCount() == 0) return std::nullopt;
-        const auto first = argument(0);
-        for (std::size_t index = 1; first && index < value->ArgumentCount(); ++index) {
+        auto result = argument(0);
+        for (std::size_t index = 1; result && index < value->ArgumentCount(); ++index) {
             const auto other = argument(index);
-            if (!other || !Same(*other, *first)) return std::nullopt;
+            if (!other) return std::nullopt;
+            if (Same(*result, *other)) continue;
+            result = dynamic ? CommonMultiple(*result, *other) : std::nullopt;
         }
-        return first && !first->dynamic ? first : std::nullopt;
+        return result && (dynamic || !result->dynamic) ? result : std::nullopt;
     }
 
     std::uint32_t vertexCount;
@@ -615,7 +632,7 @@ private:
                     address = memory.offen ? inst->Argument(2) : nullptr;
                 }
                 if (address != nullptr) {
-                    const auto evaluated = evaluator.Evaluate(address, access.predicate, access.kind == TessellationAttribute::ControlInput);
+                    const auto evaluated = evaluator.Evaluate(address, access.predicate, access.kind == TessellationAttribute::ControlInput || access.kind == TessellationAttribute::EvaluationInput);
                     if (!evaluated) Fail("the tessellation ring or LDS address is not affine in the control point and relative patch", flags.pc);
                     access.address = *evaluated;
                     access.addressValue = address;
@@ -645,7 +662,7 @@ private:
             }
             if (access.kind == TessellationAttribute::ControlOutput && access.write && access.address.vertex != 0) agree(controlStride, access.address.vertex, access.pc);
             if (access.kind == TessellationAttribute::EvaluationInput) {
-                if (access.address.relative <= 0 || access.address.relative % outputs != 0) Fail("domain shader reads of patch constants or other patches are unsupported", access.pc);
+                if (access.address.relative <= 0 || access.address.relative % outputs != 0) Fail(access.address.dynamic ? "the domain shader reads off-chip memory at a computed offset outside its patch's control points" : "domain shader reads of patch constants or other patches are unsupported", access.pc);
                 agree(controlStride, access.address.relative / outputs, access.pc);
             }
         }
@@ -689,6 +706,7 @@ private:
                 break;
             case TessellationAttribute::EvaluationInput:
                 if (address.constant < 0 || end > outputs * controlStride) Fail("the domain shader reads off-chip memory outside its patch's control points", access.pc);
+                if (address.dynamic && (address.dynamicScale == 0 || address.dynamicScale % controlStride != 0)) Fail("the domain shader reads off-chip memory at a computed offset that is not a whole number of control points", access.pc);
                 break;
             case TessellationAttribute::Factor: {
                 const auto bytes = FactorBytes(tessellation.domain);
@@ -707,9 +725,12 @@ private:
     // which replacing the index by 0 removes; every other use must not depend on it.
     bool dynamicInputAddress(IrValue* user, IrValue* value) {
         if (user->Opcode() != IrOpcode::GetTessellationAttribute || user->Argument(1)->Resolve() != value->Resolve()) return false;
-        if (!IsImmediate(user->Argument(0), static_cast<std::uint32_t>(TessellationAttribute::ControlInput))) return false;
+        const bool control = IsImmediate(user->Argument(0), static_cast<std::uint32_t>(TessellationAttribute::ControlInput));
+        const bool evaluation = IsImmediate(user->Argument(0), static_cast<std::uint32_t>(TessellationAttribute::EvaluationInput));
+        if (!control && !evaluation) return false;
         const auto address = evaluator.Evaluate(value, user->Argument(2), true);
-        return address && address->dynamic && address->relative == static_cast<std::int64_t>(tessellation.inputControlPoints) * localStride;
+        const auto stride = control ? static_cast<std::int64_t>(tessellation.inputControlPoints) * localStride : static_cast<std::int64_t>(tessellation.outputControlPoints) * controlStride;
+        return address && address->dynamic && address->relative == stride;
     }
 
     void requireRelativeIndependence(const std::vector<IrValue*>& bases) {
@@ -870,13 +891,37 @@ private:
     }
 
     IrValue& componentAddress(const Access& access, std::uint32_t component) {
-        if (access.address.dynamic) return insert(access, IrOpcode::IAdd32, IrType::U32, {access.addressValue, &constant(access.memoryOffset + 4u * component)});
+        if (access.address.dynamic) {
+            const std::uint32_t byteOffset = access.memoryOffset + 4u * component;
+            return byteOffset == 0u ? *access.addressValue : insert(access, IrOpcode::IAdd32, IrType::U32, {access.addressValue, &constant(byteOffset)});
+        }
         IrValue& offset = constant(static_cast<std::uint32_t>(access.address.constant) + 4u * component);
         const bool indexed = access.kind == TessellationAttribute::ControlInput || (access.kind == TessellationAttribute::ControlOutput && !access.write);
         if (!indexed || access.address.vertex == 0) return offset;
         IrValue& invocation = insert(access, IrOpcode::GetBuiltin, IrType::U32, {&constant(static_cast<std::uint32_t>(StageInputKind::InvocationId)), &constant(0u)});
         IrValue& scaled = insert(access, IrOpcode::IMul32, IrType::U32, {&invocation, &constant(static_cast<std::uint32_t>(access.address.vertex))});
         return insert(access, IrOpcode::IAdd32, IrType::U32, {&scaled, &offset});
+    }
+
+    void keepComputedReadsInPatch(IrValue& base) {
+        for (IrBlock* block : program.BlockOrder()) {
+            for (IrValue* inst : block->Instructions()) {
+                if (inst->Opcode() != IrOpcode::GetTessellationAttribute) continue;
+                const bool control = IsImmediate(inst->Argument(0), static_cast<std::uint32_t>(TessellationAttribute::ControlInput));
+                if (!control && !IsImmediate(inst->Argument(0), static_cast<std::uint32_t>(TessellationAttribute::EvaluationInput))) continue;
+                const auto address = evaluator.Evaluate(inst->Argument(1), inst->Argument(2), true);
+                if (!address || !address->dynamic || address->relative == 0) continue;
+                IrValue& patch = program.CreateValue(IrOpcode::IMul32, IrType::U32);
+                patch.AddArgument(&base);
+                patch.AddArgument(&constant(static_cast<std::uint32_t>(address->relative)));
+                block->InsertInstructionBefore(inst, &patch);
+                IrValue& inPatch = program.CreateValue(IrOpcode::ISub32, IrType::U32);
+                inPatch.AddArgument(inst->Argument(1));
+                inPatch.AddArgument(&patch);
+                block->InsertInstructionBefore(inst, &inPatch);
+                inst->ReplaceArgument(1, &inPatch);
+            }
+        }
     }
 
     void rewrite(const Access& access) {

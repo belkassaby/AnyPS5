@@ -112,7 +112,10 @@ struct Module {
                 return;
             }
             if (stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation) {
-                Require(input && ((value == spv::BuiltInPosition && signature == "f32x4") || (value == spv::BuiltInTessCoord && stage == Stage::TessellationEvaluation && signature == "f32x3") || ((value == spv::BuiltInInvocationId || value == spv::BuiltInPrimitiveId || value == spv::BuiltInPatchVertices) && (signature == "i32" || signature == "u32"))), "unsupported tessellation built-in");
+                // gl_ClipDistance arrives as an input array of 1-8 floats (upstream 2b9c131e0).
+                const bool clipInput = value == spv::BuiltInClipDistance && signature.size() == 6 && signature.starts_with("f32[") && signature[4] >= '1' && signature[4] <= '8' && signature[5] == ']';
+                const bool supported = input && (clipInput || (value == spv::BuiltInPosition && signature == "f32x4") || (value == spv::BuiltInTessCoord && stage == Stage::TessellationEvaluation && signature == "f32x3") || ((value == spv::BuiltInInvocationId || value == spv::BuiltInPrimitiveId || value == spv::BuiltInPatchVertices) && (signature == "i32" || signature == "u32")));
+                if (!supported) Require(false, ("unsupported tessellation built-in " + std::to_string(static_cast<std::uint32_t>(value)) + " (" + std::string(signature) + (input ? " input" : " output") + (stage == Stage::TessellationControl ? ", control stage)" : ", evaluation stage)")).c_str());
                 return;
             }
             if (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT) primitiveIndices = true;

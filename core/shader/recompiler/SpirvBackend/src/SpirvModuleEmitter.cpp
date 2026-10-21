@@ -485,9 +485,10 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
     // A hull's input control-point index can be computed from data (TessellationLowering): it is kept
     // inside the patch.
     const auto inPatch = [&](std::uint32_t vertex) {
-        if (kind != TessellationAttribute::ControlInput) return vertex;
+        if (kind != TessellationAttribute::ControlInput && kind != TessellationAttribute::EvaluationInput) return vertex;
+        const auto& tess = state.inputInfo.vertex->tess;
         const auto clamped = state.module.AllocateId();
-        state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, vertex, ConstantU32(state, tess.inputControlPoints - 1u));
+        state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, vertex, ConstantU32(state, (kind == TessellationAttribute::ControlInput ? tess.inputControlPoints : tess.outputControlPoints) - 1u));
         return clamped;
     };
     const auto* sum = inst.Argument(1);
