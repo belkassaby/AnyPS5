@@ -67,12 +67,16 @@ BasicBlock& ControlFlowGraph::FindBlockByProgramCounter(std::uint32_t programCou
     return const_cast<BasicBlock&>(static_cast<const ControlFlowGraph*>(this)->FindBlockByProgramCounter(programCounter));
 }
 
+// The dominator sets are sorted (dominatorSets, remapIds), so membership is a binary search
+// (upstream 82853352f): the structurizer asks it millions of times on graphs of thousands of blocks.
 bool ControlFlowGraph::Dominates(std::uint32_t dominator, std::uint32_t blockId) const {
-    return contains(FindBlock(blockId).dominators, dominator);
+    const auto& dominators = FindBlock(blockId).dominators;
+    return std::binary_search(dominators.begin(), dominators.end(), dominator);
 }
 
 bool ControlFlowGraph::PostDominates(std::uint32_t postDominator, std::uint32_t blockId) const {
-    return contains(FindBlock(blockId).postDominators, postDominator);
+    const auto& postDominators = FindBlock(blockId).postDominators;
+    return std::binary_search(postDominators.begin(), postDominators.end(), postDominator);
 }
 
 std::uint32_t ControlFlowGraph::FindNearestCommonPostDominator(std::uint32_t firstBlock, std::uint32_t secondBlock) const {
@@ -82,15 +86,11 @@ std::uint32_t ControlFlowGraph::FindNearestCommonPostDominator(std::uint32_t fir
     if (common.empty()) {
         return InvalidControlFlowId;
     }
+    // The nearest is the first candidate every other common block post-dominates: one whose own
+    // (sorted) post-dominator set includes the whole common set, a linear test per candidate.
     for (const auto candidate : common) {
-        bool nearest = true;
-        for (const auto other : common) {
-            if (other != candidate && !PostDominates(other, candidate)) {
-                nearest = false;
-                break;
-            }
-        }
-        if (nearest) {
+        const auto& postDominators = FindBlock(candidate).postDominators;
+        if (std::includes(postDominators.begin(), postDominators.end(), common.begin(), common.end())) {
             return candidate;
         }
     }

@@ -1,5 +1,8 @@
 #include "ControlFlow/Structurizer.hpp"
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -155,18 +158,23 @@ std::uint32_t moveBlockBefore(ControlFlowGraph& graph, std::uint32_t blockId, st
 std::vector<std::uint32_t> dominatedBlocks(const ControlFlowGraph& graph, std::uint32_t headerBlock, std::uint32_t stopBlock = InvalidControlFlowId) {
     std::vector<std::uint32_t> blocks;
     std::vector<std::uint32_t> stack = {headerBlock};
+    std::vector<bool> visited(graph.blocks.size());
     blocks.reserve(graph.blocks.size());
     stack.reserve(graph.blocks.size());
 
     while (!stack.empty()) {
         const auto blockId = stack.back();
         stack.pop_back();
-        if (blockId == stopBlock || contains(blocks, blockId) || !graph.Dominates(headerBlock, blockId)) {
+        if (blockId >= visited.size()) {
+            visited.resize(blockId + 1);
+        }
+        if (blockId == stopBlock || visited[blockId] || !graph.Dominates(headerBlock, blockId)) {
             continue;
         }
 
         const auto& block = graph.FindBlock(blockId);
-        addUnique(blocks, blockId);
+        visited[blockId] = true;
+        blocks.push_back(blockId);
         for (const auto successor : block.successors) {
             if (successor != stopBlock && graph.Dominates(headerBlock, successor)) {
                 stack.push_back(successor);
@@ -656,6 +664,11 @@ constexpr std::uint32_t CloneWordLimit = 1024u;
 constexpr std::uint32_t CloneWordFloor = 256u;
 constexpr std::uint32_t CloneShareDivisor = 8u;
 constexpr std::uint32_t CloneBudgetDivisor = 4u;
+// Shared merge splitting refuses a graph grown past this many times its block count at the
+// start of splitting (upstream 2c53270b9): splits that route through a new junction each round
+// otherwise grow some graphs to thousands of blocks, every round recomputing every analysis.
+constexpr std::uint32_t SplitGrowthFactor = 16u;
+constexpr std::uint32_t SplitGrowthFloor = 64u;
 
 struct SplitBudget {
     std::uint32_t programWords = 0;
@@ -1244,9 +1257,17 @@ bool splitOneSelectionMerge(ControlFlowGraph& graph, SplitBudget& budget, const 
 std::vector<std::uint32_t> naturalLoopBody(const ControlFlowGraph& graph, std::uint32_t headerBlock, std::uint32_t latchBlock, bool& natural) {
     std::vector<std::uint32_t> body;
     std::vector<std::uint32_t> stack;
+    // Membership in a bitmap: a loop body can hold thousands of blocks.
+    std::vector<bool> inBody(graph.blocks.size());
+    const auto mark = [&](std::uint32_t blockId) {
+        if (blockId >= inBody.size()) inBody.resize(blockId + 1);
+        if (inBody[blockId]) return false;
+        inBody[blockId] = true;
+        return true;
+    };
     natural = true;
-    addUnique(body, headerBlock);
-    addUnique(body, latchBlock);
+    if (mark(headerBlock)) body.push_back(headerBlock);
+    if (mark(latchBlock)) body.push_back(latchBlock);
     if (latchBlock != headerBlock) {
         stack.push_back(latchBlock);
     }
@@ -1259,7 +1280,7 @@ std::vector<std::uint32_t> naturalLoopBody(const ControlFlowGraph& graph, std::u
             if (!graph.Dominates(headerBlock, predecessor)) {
                 natural = false;
             }
-            if (!contains(body, predecessor)) {
+            if (mark(predecessor)) {
                 body.push_back(predecessor);
                 if (predecessor != headerBlock) {
                     stack.push_back(predecessor);
@@ -1421,11 +1442,13 @@ void Structurizer::detectNaturalLoops(ControlFlowGraph& graph) const {
         loop.continueBlock = edge.sourceBlock;
         loop.blocks = std::move(body);
 
+        // loop.blocks is sorted (naturalLoopBody), so membership is a binary search; the exits are
+        // sorted and deduplicated after.
         for (const auto blockId : loop.blocks) {
             const auto& block = graph.FindBlock(blockId);
             for (const auto successor : block.successors) {
-                if (!contains(loop.blocks, successor)) {
-                    addUnique(loop.exitBlocks, successor);
+                if (!std::binary_search(loop.blocks.begin(), loop.blocks.end(), successor)) {
+                    loop.exitBlocks.push_back(successor);
                 }
             }
         }
@@ -1576,15 +1599,50 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
 void Structurizer::splitSharedMergeBlocks(ControlFlowGraph& graph) const {
     const auto originalBlockCount = static_cast<std::uint32_t>(graph.blocks.size());
     const auto splitBudget = std::max<std::uint32_t>(16u, originalBlockCount * 4u);
+    const auto growthBudget = std::max<std::uint32_t>(SplitGrowthFloor, originalBlockCount * SplitGrowthFactor);
+    const auto started = std::chrono::steady_clock::now();
+    std::uint32_t rounds = 0;
+    // Splitting that takes over a second is named with its graph sizes in the log, with the time
+    // spent finding each split (loop, selection, return join) and recomputing the analyses after it.
+    std::array<double, 4> phaseMs{};
+    struct SlowReport {
+        const ControlFlowGraph& graph;
+        std::chrono::steady_clock::time_point started;
+        std::uint32_t originalBlocks;
+        const std::uint32_t& rounds;
+        const std::array<double, 4>& phaseMs;
+        ~SlowReport() {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+            if (ms >= 1000) std::fprintf(stderr, "[structurizer] shared merge splitting took %lld ms: %u blocks grew to %zu in %u rounds (loop splits %.0f ms, selection splits %.0f ms, return joins %.0f ms, analyses %.0f ms)\n", static_cast<long long>(ms), originalBlocks, graph.blocks.size(), rounds, phaseMs[0], phaseMs[1], phaseMs[2], phaseMs[3]);
+        }
+    } slowReport{graph, started, originalBlockCount, rounds, phaseMs};
+    auto lap = std::chrono::steady_clock::now();
+    const auto charge = [&](std::size_t phase) {
+        const auto now = std::chrono::steady_clock::now();
+        phaseMs[phase] += std::chrono::duration<double, std::milli>(now - lap).count();
+        lap = now;
+    };
     const auto programWords = estimatedSpirvWords(graph, allBlockIds(originalBlockCount));
     SplitBudget budget{programWords, std::max(CloneWordLimit, programWords / CloneBudgetDivisor), std::max(CloneWordLimit, programWords), nextGotoVariable(graph)};
     for (std::uint32_t splits = 0; splits < splitBudget; ++splits) {
-        if (!splitOneLoopMerge(graph) && !splitOneSelectionMerge(graph, budget, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); }) && !splitOneReturnJoin(graph)) {
+        lap = std::chrono::steady_clock::now();
+        const bool loopSplit = splitOneLoopMerge(graph);
+        charge(0);
+        const bool selectionSplit = !loopSplit && splitOneSelectionMerge(graph, budget, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); });
+        charge(1);
+        const bool returnSplit = !loopSplit && !selectionSplit && splitOneReturnJoin(graph);
+        charge(2);
+        if (!loopSplit && !selectionSplit && !returnSplit) {
             return;
+        }
+        ++rounds;
+        if (graph.blocks.size() > growthBudget) {
+            throw std::runtime_error("CFG shared merge splitting exceeded growth budget: originalBlocks=" + std::to_string(originalBlockCount) + " currentBlocks=" + std::to_string(graph.blocks.size()) + " growthBudget=" + std::to_string(growthBudget));
         }
         rebuildPredecessors(graph);
         recomputeAnalyses(graph);
         verifyReducibility(graph);
+        charge(3);
     }
 
     throw std::runtime_error("CFG shared merge splitting exceeded budget: originalBlocks=" + std::to_string(originalBlockCount) + " currentBlocks=" + std::to_string(graph.blocks.size()) + " splitBudget=" + std::to_string(splitBudget));
