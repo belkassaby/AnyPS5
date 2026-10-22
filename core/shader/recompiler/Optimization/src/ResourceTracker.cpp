@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_set>
@@ -305,19 +306,29 @@ private:
         return memory.kind == ResourceKind::ScalarAddress && !memory.addressIsFull && memory.dataBits == 32u && memory.dataDwords == 1u && immediateU32(read.Argument(2), high) && high == 0u && always ? &memory : nullptr;
     }
 
-    bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
+    static bool IsMemoryOp(IrOpcode op) {
+        return BufferAccessOf(op) != BufferAccess::None || AddressOpcodeInfoOf(op).access != AddressAccess::None || ImageOpcodeInfoOf(op).access != ImageAccess::None;
+    }
+
+    // Memory operations per memory index, counted once per indirect-image planning pass (which
+    // does not change the IR): scanning the whole program for every descriptor dword took
+    // minutes on large shaders (PPSA01317's Menu Book reward screen).
+    void CountMemoryUses() {
+        m_memoryUses.assign(m_program.Resources().memoryInfo.size(), 0u);
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
-                const auto op = inst->Opcode();
-                if ((BufferAccessOf(op) == BufferAccess::None && AddressOpcodeInfoOf(op).access == AddressAccess::None && ImageOpcodeInfoOf(op).access == ImageAccess::None) || inst == &owner) {
-                    continue;
-                }
-                if (inst->Flags<MemoryFlags>().index == index) {
-                    return false;
-                }
+                if (!IsMemoryOp(inst->Opcode())) continue;
+                const auto index = inst->Flags<MemoryFlags>().index;
+                if (index >= m_memoryUses.size()) m_memoryUses.resize(index + 1u, 0u);
+                m_memoryUses[index]++;
             }
         }
-        return true;
+    }
+
+    bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
+        const std::uint32_t uses = index < m_memoryUses.size() ? m_memoryUses[index] : 0u;
+        const std::uint32_t own = IsMemoryOp(owner.Opcode()) && owner.Flags<MemoryFlags>().index == index ? 1u : 0u;
+        return uses <= own;
     }
 
     bool MakeRuntimeBufferSource(const IrValue& handle, std::uint32_t& source, DescriptorSource& descriptor) {
@@ -977,6 +988,11 @@ private:
         if (!enabled) {
             return;
         }
+        CountMemoryUses();
+        // Handles already found to be no table or chain: an image used by many instructions
+        // would otherwise walk its descriptor graph (up to 16384 values) once per instruction.
+        // Keyed by access too: a sampled use of a table can be refused where a storage use is not.
+        std::array<std::unordered_set<const IrValue*>, 2> rejected;
         for (auto& block : m_program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
@@ -987,7 +1003,8 @@ private:
                 const IndirectImagePlan* planned = FindIndirectImage(*handle);
                 IndirectImagePlan plan;
                 const bool storage = imageInfo.resourceClass == ImageResourceClass::Storage;
-                if (planned == nullptr && !TryMakeTableImage(*handle, plan, storage) && !TryMakeChainImage(*handle, plan)) {
+                if (planned == nullptr && (rejected[storage].contains(handle) || (!TryMakeTableImage(*handle, plan, storage) && !TryMakeChainImage(*handle, plan)))) {
+                    if (planned == nullptr) rejected[storage].insert(handle);
                     continue;
                 }
                 // Stores select one bound slot per access (every slot is written back); atomics
@@ -1284,7 +1301,59 @@ private:
         }
         resource = AddImage(source, memory, op, flags.pc);
         if (resource == std::numeric_limits<std::uint32_t>::max()) {
-            fail("image resource limit exceeded");
+            // Named with what fills the slots: images that differ only in class, dimension or mode
+            // share a source; table images come from planned bindless tables.
+            std::unordered_set<std::uint32_t> sources;
+            std::uint32_t storage = 0;
+            std::uint32_t tables = 0;
+            for (const auto& image : m_info.images) {
+                sources.insert(image.source);
+                storage += image.resourceClass == ImageResourceClass::Storage ? 1u : 0u;
+                tables += std::any_of(m_indirectImages.begin(), m_indirectImages.end(), [&](const IndirectImagePlan& plan) { return plan.source == image.source; }) ? 1u : 0u;
+            }
+            // What tells the table sources apart: their heaps, entry offsets, strides, key ranges,
+            // material selectors and enumeration.
+            std::set<std::uint32_t> heaps, offsets, strides, maxKeys, selectorOffsets, chainStrides, chainOffsets, chainResources;
+            std::set<std::string> chainShapes;
+            for (const auto source : sources) {
+                if (source >= m_sources.size() || !m_sources[source].indirectImage.has_value() || !m_sources[source].indirectImage->chain) continue;
+                chainStrides.insert(m_sources[source].indirectImage->selectorStride);
+                // The T# word 0 read: where in the record it lies, which resource it names, and
+                // the shape of the computation down to the record.
+                const IrValue* read = m_sources[source].dwords[0] != nullptr ? m_sources[source].dwords[0]->Resolve() : nullptr;
+                if (read == nullptr) continue;
+                const auto index = read->Flags<MemoryFlags>().index;
+                if (index < m_program.Resources().memoryInfo.size()) {
+                    chainOffsets.insert(m_program.Resources().memoryInfo[index].offset);
+                    chainResources.insert(m_program.Resources().memoryInfo[index].resource);
+                }
+                std::string shape;
+                std::vector<const IrValue*> pending{read};
+                for (std::size_t visited = 0; !pending.empty() && visited < 24u; ++visited) {
+                    const auto* value = pending.back()->Resolve();
+                    pending.pop_back();
+                    shape += std::string(IrOpcodeName(value->Opcode())) + (value->HasImmediate() ? "=" + std::to_string(value->ImmediateU32()) : std::string()) + ";";
+                    if (value->Opcode() == IrOpcode::Phi) continue;
+                    for (std::size_t argument = 0; argument < value->ArgumentCount(); ++argument) pending.push_back(value->Argument(argument));
+                }
+                chainShapes.insert(shape);
+            }
+            std::uint32_t material = 0, enumerated = 0, address = 0, chain = 0;
+            for (const auto source : sources) {
+                if (source >= m_sources.size() || !m_sources[source].indirectImage.has_value()) continue;
+                const auto& table = *m_sources[source].indirectImage;
+                heaps.insert(table.heapSource);
+                offsets.insert(table.entryOffset);
+                strides.insert(table.entryStride);
+                maxKeys.insert(table.maxKey);
+                selectorOffsets.insert(table.selectorOffset);
+                material += table.hasMaterial ? 1u : 0u;
+                enumerated += table.enumerated ? 1u : 0u;
+                address += table.address ? 1u : 0u;
+                chain += table.chain ? 1u : 0u;
+            }
+            const auto range = [](const std::set<std::uint32_t>& values) { return values.empty() ? std::string("-") : std::to_string(values.size()) + " [0x" + [](std::uint32_t v) { char t[16]; std::snprintf(t, sizeof(t), "%x", v); return std::string(t); }(*values.begin()) + "..0x" + [](std::uint32_t v) { char t[16]; std::snprintf(t, sizeof(t), "%x", v); return std::string(t); }(*values.rbegin()) + "]"; };
+            fail("image resource limit exceeded (" + std::to_string(m_info.images.size()) + " images: " + std::to_string(sources.size()) + " distinct sources, " + std::to_string(storage) + " storage, " + std::to_string(tables) + " from bindless tables; " + std::to_string(m_indirectImages.size()) + " tables planned; table sources by heap " + range(heaps) + ", entry offset " + range(offsets) + ", stride " + range(strides) + ", max key " + range(maxKeys) + ", selector offset " + range(selectorOffsets) + ", " + std::to_string(material) + " with material, " + std::to_string(enumerated) + " enumerated, " + std::to_string(address) + " address, " + std::to_string(chain) + " chain; chains by record stride " + range(chainStrides) + ", T# word 0 at record offset " + range(chainOffsets) + ", memory resource " + range(chainResources) + ", " + std::to_string(chainShapes.size()) + " distinct read shapes)");
         }
         AddHandlePatch(handle, resource);
         std::uint32_t sampler = 0;
@@ -1334,6 +1403,7 @@ private:
     }
 
     IrProgram& m_program;
+    std::vector<std::uint32_t> m_memoryUses;
     ShaderInfo m_info;
     IrBuilder m_builder;
     // Stores every invocation makes (BufferResource::covers), and the block Collect is visiting.
