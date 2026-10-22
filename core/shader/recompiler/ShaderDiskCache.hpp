@@ -48,6 +48,8 @@ struct SpecializationTarget {
 };
 
 [[nodiscard]] std::uint64_t SourceVersion();
+// The recompiler sources' version (Generated::SourceVersion unless APS5_SHADER_SOURCE_VERSION pins it).
+[[nodiscard]] std::uint64_t BaseSourceVersion();
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 

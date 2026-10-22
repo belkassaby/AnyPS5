@@ -723,7 +723,7 @@ std::string hex(std::uint64_t value) {
 constexpr std::uint32_t ModuleKeyTag = 0x444f4d53u;
 
 std::vector<std::byte> frameEntry(std::span<const std::byte> key, std::span<const std::byte> payload) {
-    const FileHeader header{FileMagic, FormatVersion, Generated::SourceVersion, key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
+    const FileHeader header{FileMagic, FormatVersion, BaseSourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
     std::vector<std::byte> file(sizeof(header) + key.size() + payload.size());
     std::memcpy(file.data(), &header, sizeof(header));
     std::memcpy(file.data() + sizeof(header), key.data(), key.size());
@@ -735,7 +735,7 @@ LoadStatus unframeEntry(std::span<const std::byte> file, std::span<const std::by
     if (file.size() < sizeof(FileHeader)) return LoadStatus::Rejected;
     FileHeader header;
     std::memcpy(&header, file.data(), sizeof(header));
-    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != Generated::SourceVersion) return LoadStatus::Rejected;
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != BaseSourceVersion()) return LoadStatus::Rejected;
     const auto body = file.size() - sizeof(header);
     if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return LoadStatus::Rejected;
     const auto storedKey = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
@@ -960,10 +960,25 @@ DiskStore& store() {
 
 }
 
+std::uint64_t BaseSourceVersion() {
+    // APS5_SHADER_SOURCE_VERSION=<hex> pins the recompiler sources' version, for a build whose
+    // recompiler changes leave every generated module as it was (speed-ups, diagnostics): its cache
+    // and pipeline journal stay those of the pinned build. A change that alters the generated code
+    // must not be pinned, or the cache serves modules the sources no longer produce.
+    static const std::uint64_t version = [] {
+        const char* text = std::getenv("APS5_SHADER_SOURCE_VERSION");
+        if (text == nullptr || *text == '\0') return Generated::SourceVersion;
+        const auto pinned = std::strtoull(text, nullptr, 16);
+        std::fprintf(stderr, "[shader-disk-cache] source version pinned to %016llx (built %016llx)\n", static_cast<unsigned long long>(pinned), static_cast<unsigned long long>(Generated::SourceVersion));
+        return static_cast<std::uint64_t>(pinned);
+    }();
+    return version;
+}
+
 std::uint64_t SourceVersion() {
     // Switches that change the generated code take part in the version, so each setting keeps its
     // own entries (APS5_BDA_HINT_FAST, see SpirvBdaRead.cpp).
-    static const std::uint64_t version = (std::getenv("APS5_BDA_HINT_FAST") != nullptr ? Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull : Generated::SourceVersion) ^ (std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr ? 0xc2b2ae3d27d4eb4full : 0ull) ^ (std::getenv("APS5_BDA_INLINE_HIT") != nullptr ? 0x165667b19e3779f9ull : 0ull) ^ (std::getenv("APS5_BDA_VICTIM") != nullptr ? 0x27d4eb2f165667c5ull : 0ull) ^ (std::getenv("APS5_PS_FULL_EXEC") != nullptr ? 0x94d049bb133111ebull : 0ull) ^ (std::getenv("APS5_LANE_BIT_FOLD") != nullptr ? 0xbf58476d1ce4e5b9ull : 0ull) ^ (std::getenv("APS5_BDA_INLINE_ALL") != nullptr ? 0x2545f4914f6cdd1dull : 0ull) ^ (std::getenv("APS5_BDA_CLOCK") != nullptr ? 0x9fb21c651e98df25ull : 0ull) ^ (std::getenv("APS5_SAMPLEID_ZERO") != nullptr ? 0xd6e8feb86659fd93ull : 0ull) ^ (std::getenv("APS5_NO_BDA_ANCHORS") != nullptr ? 0x8cb92ba72f3d8dd7ull : 0ull);
+    static const std::uint64_t version = (std::getenv("APS5_BDA_HINT_FAST") != nullptr ? BaseSourceVersion() ^ 0x9e3779b97f4a7c15ull : BaseSourceVersion()) ^ (std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr ? 0xc2b2ae3d27d4eb4full : 0ull) ^ (std::getenv("APS5_BDA_INLINE_HIT") != nullptr ? 0x165667b19e3779f9ull : 0ull) ^ (std::getenv("APS5_BDA_VICTIM") != nullptr ? 0x27d4eb2f165667c5ull : 0ull) ^ (std::getenv("APS5_PS_FULL_EXEC") != nullptr ? 0x94d049bb133111ebull : 0ull) ^ (std::getenv("APS5_LANE_BIT_FOLD") != nullptr ? 0xbf58476d1ce4e5b9ull : 0ull) ^ (std::getenv("APS5_BDA_INLINE_ALL") != nullptr ? 0x2545f4914f6cdd1dull : 0ull) ^ (std::getenv("APS5_BDA_CLOCK") != nullptr ? 0x9fb21c651e98df25ull : 0ull) ^ (std::getenv("APS5_SAMPLEID_ZERO") != nullptr ? 0xd6e8feb86659fd93ull : 0ull) ^ (std::getenv("APS5_NO_BDA_ANCHORS") != nullptr ? 0x8cb92ba72f3d8dd7ull : 0ull);
     return version;
 }
 

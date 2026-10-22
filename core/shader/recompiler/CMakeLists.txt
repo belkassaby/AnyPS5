@@ -218,6 +218,7 @@ function(add_shader_recompiler target runtimeTarget)
             CoveredBufferBytes
             CaptureResources
             DebugProbeActive
+            ShaderDiskCache::BaseSourceVersion
             DepthBitsTextureWidth
             HashBytes
             RecompileCacheKey::HashCode

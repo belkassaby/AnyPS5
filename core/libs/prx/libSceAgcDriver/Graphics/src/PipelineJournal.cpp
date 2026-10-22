@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderCacheVersion.hpp"
+#include "ShaderDiskCache.hpp"
 #include "RuntimeAbi.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <algorithm>
@@ -487,7 +488,7 @@ struct LoadedJournal {
 };
 
 std::uint64_t sourceVersion() {
-    return ShaderRecompiler::ShaderDiskCache::Generated::SourceVersion;
+    return ShaderRecompiler::ShaderDiskCache::BaseSourceVersion();
 }
 
 class Journal {
