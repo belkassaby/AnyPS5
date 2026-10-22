@@ -19,6 +19,10 @@ std::optional<std::uint32_t> FindGuestTextureFormat(VkFormat format, std::uint32
 std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::uint32_t elementBytes);
 std::uint32_t BytesPerElement(std::uint32_t guestFormat);
 bool IsConvertedTextureFormat(std::uint32_t guestFormat);
+// Format 43 (unsigned float R10 G11 B11 from bit 0) is sampled natively as B10G11R11_UFLOAT with
+// the guest R and B fields exchanged (RepackTextureWord), and viewed with R and B swapped back.
+bool IsRepackedTextureFormat(std::uint32_t guestFormat);
+std::uint32_t RepackTextureWord(std::uint32_t word);
 bool IsBlockCompressed(std::uint32_t guestFormat);
 std::uint32_t BlockWidth(std::uint32_t guestFormat);
 std::uint32_t BlockHeight(std::uint32_t guestFormat);

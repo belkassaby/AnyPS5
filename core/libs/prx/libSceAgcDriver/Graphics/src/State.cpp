@@ -928,7 +928,10 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             if (told.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[color] COLOR_11_11_10 target 0x%llx blends (%u levels, %u layers); rendered packed without the blend\n", static_cast<unsigned long long>(baseSurfaceAddress), color.mipCount, color.arraySize);
         }
     }
-    if (decoded.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 && DebugValue(DebugKey::Packed111110) == 0 && color.mipCount > 1u) {
+    // A mipmapped target stays packed while format-43 readers sample the packed bits natively
+    // (IsRepackedTextureFormat): a native B10G11R11 target would hand them Vulkan's bit layout.
+    constexpr std::uint32_t format43 = 43u;
+    if (decoded.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 && DebugValue(DebugKey::Packed111110) == 0 && color.mipCount > 1u && !IsRepackedTextureFormat(format43)) {
         decoded = {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 0xc6u};
     }
     color.bytes = colorLayout.Bytes();

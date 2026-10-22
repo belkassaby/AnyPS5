@@ -128,6 +128,7 @@ std::uint32_t SrgbDecodeFormats(PFN_vkGetPhysicalDeviceFormatProperties formatPr
 }
 
 VkFormat SampledTextureFormat(const Context& context, std::uint32_t guestFormat) {
+    if (IsRepackedTextureFormat(guestFormat)) return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     const auto format = static_cast<ShaderRecompiler::IrBufferFormat>(guestFormat);
     if ((context.srgbDecodeFormats & ShaderRecompiler::SrgbDecodeBit(format)) == 0u) return ResolveTextureFormat(guestFormat);
     return ResolveTextureFormat(static_cast<std::uint32_t>(ShaderRecompiler::SrgbUnormFormat(format)));
@@ -146,6 +147,16 @@ std::uint32_t BytesPerElement(std::uint32_t guestFormat) {
 
 bool IsConvertedTextureFormat(std::uint32_t guestFormat) {
     return remapGuestFormat(guestFormat) != guestFormat;
+}
+
+bool IsRepackedTextureFormat(std::uint32_t guestFormat) {
+    // APS5_NO_REPACKED_FORMAT43=1 samples format 43 through the R32_UINT conversion as before.
+    static const bool enabled = std::getenv("APS5_NO_REPACKED_FORMAT43") == nullptr;
+    return enabled && guestFormat == static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format10_11_11Float);
+}
+
+std::uint32_t RepackTextureWord(std::uint32_t word) {
+    return ((word >> 21u) & 0x7ffu) | (((word >> 10u) & 0x7ffu) << 11u) | ((word & 0x3ffu) << 22u);
 }
 
 std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::uint32_t elementBytes) {

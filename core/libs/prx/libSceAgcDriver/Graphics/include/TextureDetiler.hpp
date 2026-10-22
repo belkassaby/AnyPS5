@@ -47,6 +47,9 @@ namespace AgcDriver::Graphics {
         // same-size unsigned 2D-array view of one mip (in the general layout), `slice` its layer;
         // `retile` stores the texels into `tiled`, otherwise the tiled bytes are stored into the image.
         void DispatchImage(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkImageView view, VkBuffer tiled, std::uint64_t tiledOffset, const TileMipLayout& layout, bool retile, std::uint32_t slice, const DetileWindow& window);
+        // Rewrites `bytes` of format-43 words (R10 G11 B11 from bit 0) as B10G11R11_UFLOAT words with
+        // the guest R and B fields exchanged: the same component bits, viewed back with R and B swapped.
+        void DispatchRepack(VkCommandBuffer commands, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, std::uint64_t bytes);
         // Recycles the descriptor sets of the previous batch; call before recording a new command batch.
         void BeginBatch();
 
@@ -59,6 +62,8 @@ namespace AgcDriver::Graphics {
         VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
         VkShaderModule module = VK_NULL_HANDLE;
+        VkShaderModule repackModule = VK_NULL_HANDLE;
+        VkPipeline repackPipeline = VK_NULL_HANDLE;
         std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines;
         std::vector<VkDescriptorPool> descriptorPools;
         std::size_t allocatedSets = 0;

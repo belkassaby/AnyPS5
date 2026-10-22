@@ -71,6 +71,15 @@ public:
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D);
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    // A format-43 texture whose results a storage image (R32_UINT, the guest bits) still holds: an
+    // image of its own, copied from the storage image through the repack pass on the GPU, and
+    // copied again by RefreshRepackCopy whenever the storage image's version moved.
+    struct RepackCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, RepackCopyTag);
+    static bool CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    bool RepackCopy() const { return repackSource != nullptr; }
+    const std::shared_ptr<StorageTexture>& RepackSource() const { return repackSource; }
+    void RefreshRepackCopy();
     ~Texture();
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
@@ -127,6 +136,10 @@ private:
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
+    std::shared_ptr<StorageTexture> repackSource;
+    std::uint64_t repackedVersion = 0;
+    bool repackedOnce = false;
+    std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);

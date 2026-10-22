@@ -72,6 +72,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcTextureRepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureRepack.comp)
+set(agcTextureRepackShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepack.spv)
+set(agcTextureRepackShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepack_spv.h)
+add_custom_command(
+        OUTPUT "${agcTextureRepackShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcTextureRepackShaderSpv}" "${agcTextureRepackShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureRepackShaderSpv} -DOUTPUT=${agcTextureRepackShaderHeader}
+        -DSYMBOL=TEXTURE_REPACK_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcTextureRepackShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcFloat11RepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/Float11Repack.comp)
 set(agcFloat11RepackShaderSpv ${agcTextureDetileGeneratedDir}/Float11Repack.spv)
 set(agcFloat11RepackShaderHeader ${agcTextureDetileGeneratedDir}/Float11Repack_spv.h)
@@ -189,6 +202,7 @@ set(agcDriverSources
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcFloat11RepackShaderHeader}
+        ${agcTextureRepackShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -673,6 +687,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcFloat11RepackShaderHeader}
+        ${agcTextureRepackShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp
 )

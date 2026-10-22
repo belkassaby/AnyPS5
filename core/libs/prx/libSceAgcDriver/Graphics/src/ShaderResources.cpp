@@ -56,6 +56,11 @@ VkComponentSwizzle ComponentSwizzleFor(std::uint8_t dstSel) {
 }
 
 VkComponentMapping ViewComponents(const GuestTextureResource& resource) {
+    if (IsRepackedTextureFormat(resource.format)) {
+        // The guest R field is stored in the Vulkan B channel and guest B in Vulkan R.
+        const auto channel = [](VkComponentSwizzle swizzle) { return swizzle == VK_COMPONENT_SWIZZLE_R ? VK_COMPONENT_SWIZZLE_B : swizzle == VK_COMPONENT_SWIZZLE_B ? VK_COMPONENT_SWIZZLE_R : swizzle; };
+        return {channel(ComponentSwizzleFor(resource.dstSelX)), channel(ComponentSwizzleFor(resource.dstSelY)), channel(ComponentSwizzleFor(resource.dstSelZ)), channel(ComponentSwizzleFor(resource.dstSelW))};
+    }
     if (IsConvertedTextureFormat(resource.format)) return {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};
     return {ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
 }
@@ -330,7 +335,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
+    // A repacked (format-43) texture is never a view of the storage image, whose words keep the
+    // guest layout: it is a copy of it through the repack pass (Texture::RepackCopyTag), or, when the
+    // image cannot serve one, the pending results are flushed and the surface uploaded.
+    const bool repacked = IsRepackedTextureFormat(resource.format);
+    if (source != nullptr && (depthCompare || (repacked ? !Texture::CanRepackCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource)) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
@@ -354,7 +363,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // import, recorded behind the producer, so no bytes are read or compared on the CPU and nothing
     // waits for the producer. A fast-cleared surface (keys) is viewed only through an image whose own
     // descriptor carries the DCC address (below); it stays a snapshot otherwise, its texels not read.
-    if (!depthCompare && source == nullptr && !clearThroughKeys && SampledFromStorageEligible(context, resource, guestBytes)) {
+    if (!depthCompare && !repacked && source == nullptr && !clearThroughKeys && SampledFromStorageEligible(context, resource, guestBytes)) {
 
         keys = scanKeys();
         if (*keys == DccKeys::Uncompressed) {
@@ -395,6 +404,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     if (!keys.has_value()) keys = scanKeys();
     if (disabled) {
+        if (source != nullptr && repacked) return std::make_shared<Texture>(context, source, resource, components, Texture::RepackCopyTag{});
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
@@ -411,6 +421,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
                 static const bool alwaysRefresh = std::getenv("APS5_ALWAYS_REFRESH_VIEWS") != nullptr;
                 if (alwaysRefresh || !GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                if (it->texture->RepackCopy()) it->texture->RefreshRepackCopy();
                 static const bool verifyViews = std::getenv("APS5_VERIFY_TEXTURES") != nullptr;
                 static std::atomic<std::uint64_t> viewHits{0};
                 if (verifyViews && (viewHits.fetch_add(1, std::memory_order_relaxed) % 20000u) == 0u) std::fprintf(stderr, "[verify-tex] %llu storage-view hits (not byte-checked)\n", static_cast<unsigned long long>(viewHits.load(std::memory_order_relaxed)));
@@ -457,7 +468,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
-        entry.texture = std::make_shared<Texture>(context, source, resource, components);
+        entry.texture = repacked ? std::make_shared<Texture>(context, source, resource, components, Texture::RepackCopyTag{}) : std::make_shared<Texture>(context, source, resource, components);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.

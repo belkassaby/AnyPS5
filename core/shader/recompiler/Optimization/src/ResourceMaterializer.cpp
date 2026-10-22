@@ -173,8 +173,13 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
         }
         decoded.packedFormat = format;
     }
-    decoded.conversionFormat = RemapTextureFormat(format) != format ? format : IrBufferFormat::Invalid;
-    if (format == IrBufferFormat::Format11_11_10UNorm || format == IrBufferFormat::Format10_11_11Float) {
+    // A sampled format-43 image is a B10G11R11 float texture (the driver repacks its words without
+    // changing a component bit), so it is sampled, filtered and mipmapped natively. Storage access and
+    // packed reads keep the R32_UINT conversion. APS5_NO_REPACKED_FORMAT43=1 converts every access.
+    static const bool repackedFormat43 = std::getenv("APS5_NO_REPACKED_FORMAT43") == nullptr;
+    const bool nativeRepacked = repackedFormat43 && format == IrBufferFormat::Format10_11_11Float && !storage && !base.packed;
+    decoded.conversionFormat = RemapTextureFormat(format) != format && !nativeRepacked ? format : IrBufferFormat::Invalid;
+    if (format == IrBufferFormat::Format11_11_10UNorm || (format == IrBufferFormat::Format10_11_11Float && !nativeRepacked)) {
         const bool floating = format == IrBufferFormat::Format10_11_11Float;
         if (!base.srgbDecodeCompatible && (storage || base.indirectRoot != ImageResource::NoIndirectImage || base.depthCompare || base.packed)) throw std::runtime_error(floating ? "samples or gathers a converted float image, or queries its LOD, which is not implemented" : "sampling, gathering or querying LOD of a converted unorm image is not implemented");
         if (!base.depthBitsCompatible) throw std::runtime_error(floating ? "reads or writes a converted float image with 16-bit data, which is not implemented" : "reads or writes a converted unorm image with 16-bit data, which is not implemented");
@@ -192,7 +197,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     const bool wideSint = format == IrBufferFormat::Format32SInt || format == IrBufferFormat::Format32_32SInt || format == IrBufferFormat::Format32_32_32_32SInt;
     const bool narrowSint = format == IrBufferFormat::Format16SInt || format == IrBufferFormat::Format8_8SInt || format == IrBufferFormat::Format16_16SInt || format == IrBufferFormat::Format8_8_8_8SInt || format == IrBufferFormat::Format16_16_16_16SInt;
     const bool rawSintStorage = storage && (wideSint || (narrowSint && !base.packed)) && base.written && !base.read && !base.atomic;
-    decoded.numericClass = base.atomic ? IrTextureNumericClass::Uint : SampledTextureNumericClass(format);
+    decoded.numericClass = base.atomic ? IrTextureNumericClass::Uint : nativeRepacked ? IrTextureNumericClass::Float : SampledTextureNumericClass(format);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
         if (!base.depthBitsCompatible) throw std::runtime_error("runtime image reads depth bits as unsupported 16-bit results");
