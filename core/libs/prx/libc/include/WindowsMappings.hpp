@@ -534,7 +534,14 @@ public:
                 const auto stop = std::min(end, base + pageBytes);
                 if (profiled) collectProfile().viewPages.fetch_add(1, std::memory_order_relaxed);
                 if (view.protection == PAGE_NOACCESS) return false;
-                const bool pinned = view.page->pins != 0;
+                // APS5_NO_ARM_SHARED=1: shared pages are never write-protected and every collect
+                // reports them written, as for a pinned page. A tracking fault is dispatched on the
+                // faulting guest thread's stack, and Windows writes its exception frame over the
+                // 128 bytes below rsp that SysV guest code keeps locals in (the red zone): PPSA01317's
+                // BVH jobs then read a clobbered pointer (app.exe+0x169a7b8) after a fault in the
+                // same frame.
+                static const bool noArmShared = std::getenv("APS5_NO_ARM_SHARED") != nullptr;
+                const bool pinned = view.page->pins != 0 || noArmShared;
                 if (pinned || view.seen != view.page->generation) {
                     const auto needed = (stop - cursor + 4095) / 4096;
                     if (needed > capacity - *count) {
