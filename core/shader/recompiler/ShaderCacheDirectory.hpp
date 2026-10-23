@@ -61,9 +61,16 @@ inline bool ReadWholeFile(const std::filesystem::path& path, std::vector<std::by
     if (size < 0) return false;
     file.seekg(0, std::ios::beg);
     bytes.resize(static_cast<std::size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
-        bytes.clear();
-        return false;
+    // In chunks: the C runtime refuses a single read of 2 GiB or more (an invalid-parameter
+    // report), which a pipeline journal past 2 GiB hit on every record.
+    constexpr std::size_t chunk = std::size_t{256} << 20u;
+    for (std::size_t done = 0; done < bytes.size();) {
+        const auto part = std::min(chunk, bytes.size() - done);
+        if (!file.read(reinterpret_cast<char*>(bytes.data() + done), static_cast<std::streamsize>(part))) {
+            bytes.clear();
+            return false;
+        }
+        done += part;
     }
     return true;
 }

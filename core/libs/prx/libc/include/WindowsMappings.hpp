@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -36,31 +37,46 @@ public:
     GuestQuiesce() {
         static const bool enabled = std::getenv("APS5_NO_GUEST_QUIESCE") == nullptr;
         if (!enabled) return;
+        const auto t0 = std::chrono::steady_clock::now();
         collectRanges();
-        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) return;
-        const auto process = GetCurrentProcessId();
-        const auto self = GetCurrentThreadId();
-        THREADENTRY32 entry{};
-        entry.dwSize = sizeof(entry);
-        for (BOOL more = Thread32First(snapshot, &entry); more && count < MaxThreads; more = Thread32Next(snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
-            const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+        const auto t1 = std::chrono::steady_clock::now();
+        // Threads blocked in a kernel wait are not running guest code (their user-mode rip is in
+        // ntdll), so only running and ready threads are suspended and inspected: suspending and
+        // reading the context of every thread (~200 in PPSA01317) took 130-300 ms per conversion,
+        // which stretched each streamed map of the licence track to that. A waiting thread that wakes
+        // during the conversion is the remaining (narrow) window. APS5_FULL_GUEST_QUIESCE=1 inspects
+        // every thread as before.
+        static const bool full = std::getenv("APS5_FULL_GUEST_QUIESCE") != nullptr;
+        const bool stated = !full && collectStates();
+        const auto t2 = std::chrono::steady_clock::now();
+        if (!stated) collectSnapshot();
+        const auto t3 = std::chrono::steady_clock::now();
+        // Every candidate is suspended first and inspected after, so the threads' suspensions
+        // take effect concurrently (a thread inside a long kernel call delays its own).
+        HANDLE pending[MaxThreads];
+        std::size_t suspended = 0;
+        for (std::size_t i = 0; i < candidateCount; ++i) {
+            const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, candidates[i]);
             if (thread == nullptr) continue;
             if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
                 CloseHandle(thread);
                 continue;
             }
+            pending[suspended++] = thread;
+        }
+        for (std::size_t i = 0; i < suspended; ++i) {
             // GetThreadContext also waits until the suspension has taken effect.
             context.ContextFlags = CONTEXT_CONTROL;
-            if (GetThreadContext(thread, &context) && inGuest(context.Rip)) {
-                held[count++] = thread;
+            if (GetThreadContext(pending[i], &context) && inGuest(context.Rip)) {
+                held[count++] = pending[i];
                 continue;
             }
-            ResumeThread(thread);
-            CloseHandle(thread);
+            ResumeThread(pending[i]);
+            CloseHandle(pending[i]);
         }
-        CloseHandle(snapshot);
+        const auto t4 = std::chrono::steady_clock::now();
+        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        if (ms(t0, t4) > 20.0) std::fprintf(stderr, "[quiesce] %.1f ms: modules %.1f, thread states %.1f, snapshot %.1f, suspend %.1f (%zu inspected, %zu held, %zu waiting skipped)\n", ms(t0, t4), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), suspended, count, waitingCount);
         heldTotal().fetch_add(count, std::memory_order_relaxed);
         quiesces().fetch_add(1, std::memory_order_relaxed);
     }
@@ -89,7 +105,86 @@ private:
         std::uintptr_t end;
     };
 
+    // The ids of this process's other threads not in a kernel wait (ThreadState 5), from one
+    // NtQuerySystemInformation(SystemProcessInformation) call; false when it is unavailable.
+    bool collectStates() {
+        using Query = LONG(WINAPI*)(ULONG, void*, ULONG, ULONG*);
+        static const auto query = reinterpret_cast<Query>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
+        if (query == nullptr) return false;
+        static std::vector<unsigned char> buffer(1u << 20);
+        ULONG needed = 0;
+        LONG status = 0;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            status = query(5, buffer.data(), static_cast<ULONG>(buffer.size()), &needed);
+            if (status != static_cast<LONG>(0xC0000004)) break;  // STATUS_INFO_LENGTH_MISMATCH
+            buffer.resize(std::max<std::size_t>(buffer.size() * 2, needed + (64u << 10)));
+        }
+        if (status < 0) return false;
+        // x64 layouts: SYSTEM_PROCESS_INFORMATION is 0x100 bytes (NumberOfThreads at 0x04,
+        // UniqueProcessId at 0x50), followed by its SYSTEM_THREAD_INFORMATION entries of 0x50 bytes
+        // (ClientId.UniqueThread at 0x30, ThreadState at 0x44).
+        const auto process = static_cast<std::uintptr_t>(GetCurrentProcessId());
+        for (std::size_t offset = 0;;) {
+            const auto* entry = buffer.data() + offset;
+            std::uintptr_t id = 0;
+            std::memcpy(&id, entry + 0x50, sizeof(id));
+            if (id == process) {
+                ULONG threads = 0;
+                std::memcpy(&threads, entry + 0x04, sizeof(threads));
+                const auto self = GetCurrentThreadId();
+                for (ULONG i = 0; i < threads; ++i) {
+                    const auto* thread = entry + 0x100 + i * 0x50;
+                    std::uintptr_t tid = 0;
+                    ULONG state = 0;
+                    std::memcpy(&tid, thread + 0x30, sizeof(tid));
+                    std::memcpy(&state, thread + 0x44, sizeof(state));
+                    if (static_cast<DWORD>(tid) == self) continue;
+                    if (state == 5) ++waitingCount;
+                    else if (candidateCount < MaxThreads) candidates[candidateCount++] = static_cast<DWORD>(tid);
+                }
+                return true;
+            }
+            ULONG next = 0;
+            std::memcpy(&next, entry, sizeof(next));
+            if (next == 0) return false;
+            offset += next;
+        }
+    }
+
+    // Every other thread of this process (APS5_FULL_GUEST_QUIESCE, or no thread states).
+    void collectSnapshot() {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return;
+        const auto process = GetCurrentProcessId();
+        const auto self = GetCurrentThreadId();
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (BOOL more = Thread32First(snapshot, &entry); more && candidateCount < MaxThreads; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID == process && entry.th32ThreadID != self) candidates[candidateCount++] = entry.th32ThreadID;
+        }
+        CloseHandle(snapshot);
+    }
+
+    // The guest module ranges, enumerated again at most every 5 s (guest modules load at boot; the
+    // enumeration cost ~5 ms per quiesce). Quiesces run under the mappings mutex, one at a time.
     void collectRanges() {
+        static Range cached[MaxRanges];
+        static std::size_t cachedCount = 0;
+        static std::chrono::steady_clock::time_point taken{};
+        const auto now = std::chrono::steady_clock::now();
+        if (cachedCount == 0 || now - taken > std::chrono::seconds(5)) {
+            rangeCount = 0;
+            enumerateRanges();
+            std::copy(ranges, ranges + rangeCount, cached);
+            cachedCount = rangeCount;
+            taken = now;
+            return;
+        }
+        std::copy(cached, cached + cachedCount, ranges);
+        rangeCount = cachedCount;
+    }
+
+    void enumerateRanges() {
         HMODULE modules[1024];
         DWORD needed = 0;
         if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
@@ -117,6 +212,9 @@ private:
     std::size_t count = 0;
     Range ranges[MaxRanges];
     std::size_t rangeCount = 0;
+    DWORD candidates[MaxThreads];
+    std::size_t candidateCount = 0;
+    std::size_t waitingCount = 0;
 };
 
 class WindowsMappings {
@@ -177,9 +275,40 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched) {
         std::lock_guard lock(mutex);
-        ConversionScope conversion(*this);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
+        // A map repeating the current one (every page already shows the same physical page with the
+        // same protection) changes nothing: it returns before the reset, which unmaps and remaps
+        // every 16 KiB view (PPSA01317 remaps a 200 MiB render target over and over during the
+        // licence briefing, and each view's unmap took ~30 ms once the GPU imported it: minutes
+        // per map). APS5_NO_SAME_MAP_SKIP=1 always resets.
+        static const bool skipSame = std::getenv("APS5_NO_SAME_MAP_SKIP") == nullptr;
+        ++quiesceStats.maps;
+        const auto mapStart = std::chrono::steady_clock::now();
+        struct MapTimed {
+            WindowsMappings& owner;
+            std::chrono::steady_clock::time_point start;
+            ~MapTimed() {
+                const auto now = std::chrono::steady_clock::now();
+                auto& stats = owner.quiesceStats;
+                stats.mapMs += std::chrono::duration<double, std::milli>(now - start).count();
+                if (now - stats.since >= std::chrono::seconds(10)) {
+                    std::fprintf(stderr, "[mappings] (10 s) %llu maps taking %.0f ms, %llu page shares taking %.0f ms, %llu guest quiesces taking %.0f ms (max %.1f ms)\n", static_cast<unsigned long long>(stats.maps), stats.mapMs, static_cast<unsigned long long>(stats.shares), stats.shareMs, static_cast<unsigned long long>(stats.count), stats.ms, stats.maxMs);
+                    stats = {};
+                    stats.since = now;
+                }
+            }
+        } mapTimed{*this, mapStart};
+        if (skipSame && sameMapping(cursor, bytes, section, offset, protection)) {
+            watchResident = watched;
+            note(10, cursor, cursor + bytes);
+            return;
+        }
+        ConversionScope conversion(*this);
+        const auto resetStart = std::chrono::steady_clock::now();
+        const auto quiesceBefore = quiesceMs;
         reset(cursor, bytes);
+        const auto resetMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - resetStart).count();
+        if (resetMs > 100.0) std::fprintf(stderr, "[mappings] slow map reset: 0x%llx+0x%zx took %.0f ms (%.0f ms suspending guest threads)\n", static_cast<unsigned long long>(cursor), bytes, resetMs, quiesceMs - quiesceBefore);
         watchResident = watched;
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
@@ -429,14 +558,14 @@ public:
                 put("; ");
             }
         }
-        static const char* const names[] = {"?", "commit", "map-resident", "map-shared", "cut", "share", "evict", "unmap-view", "release", "alias"};
+        static const char* const names[] = {"?", "commit", "map-resident", "map-shared", "cut", "share", "evict", "unmap-view", "release", "alias", "same-map"};
         const auto now = GetTickCount64();
         const auto total = conversionCount.load(std::memory_order_relaxed);
         int shown = 0;
         for (std::uint64_t back = 0; back < total && back < ConversionLog && shown < 10; ++back) {
             const auto& entry = conversions[(total - 1 - back) % ConversionLog];
             if (entry.end + 0x200000 <= address || entry.start >= address + 0x200000) continue;
-            put("[%s 0x%llx-0x%llx %llu ms ago thread %lu] ", names[entry.kind < 10 ? entry.kind : 0], static_cast<unsigned long long>(entry.start), static_cast<unsigned long long>(entry.end), static_cast<unsigned long long>(now - entry.when), entry.thread);
+            put("[%s 0x%llx-0x%llx %llu ms ago thread %lu] ", names[entry.kind < 11 ? entry.kind : 0], static_cast<unsigned long long>(entry.start), static_cast<unsigned long long>(entry.end), static_cast<unsigned long long>(now - entry.when), entry.thread);
             ++shown;
         }
         put("(%llu conversions logged)", static_cast<unsigned long long>(total));
@@ -844,12 +973,34 @@ private:
         GuestQuiesce* quiesce = nullptr;
     };
     ConversionScope* conversionScope = nullptr;
+    // Time spent suspending guest threads (GuestQuiesce), for the slow-map report.
+    double quiesceMs = 0.0;
+    struct QuiesceStats {
+        std::uint64_t maps = 0;
+        std::uint64_t shares = 0;
+        double shareMs = 0.0;
+        double mapMs = 0.0;
+        std::uint64_t count = 0;
+        double ms = 0.0;
+        double maxMs = 0.0;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    } quiesceStats;
     void quiesceForConversion() {
         // The outermost open scope holds the suspension (the GuestQuiesce is new'd before any
         // thread is suspended, so the heap is free then).
         auto* scope = conversionScope;
         while (scope != nullptr && scope->outer != nullptr) scope = scope->outer;
-        if (scope != nullptr && scope->quiesce == nullptr) scope->quiesce = new GuestQuiesce;
+        if (scope != nullptr && scope->quiesce == nullptr) {
+            const auto start = std::chrono::steady_clock::now();
+            scope->quiesce = new GuestQuiesce;
+            const auto now = std::chrono::steady_clock::now();
+            const auto ms = std::chrono::duration<double, std::milli>(now - start).count();
+            quiesceMs += ms;
+            // Every 10 s: how many conversions suspended the guest, and what that cost.
+            ++quiesceStats.count;
+            quiesceStats.ms += ms;
+            quiesceStats.maxMs = std::max(quiesceStats.maxMs, ms);
+        }
     }
     void cut(std::uintptr_t at) {
         auto it = residentRuns.upper_bound(at);
@@ -879,6 +1030,15 @@ private:
     }
 
     void share(std::uintptr_t base) {
+        const auto shareStart = std::chrono::steady_clock::now();
+        struct Timed {
+            QuiesceStats& stats;
+            std::chrono::steady_clock::time_point start;
+            ~Timed() {
+                ++stats.shares;
+                stats.shareMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            }
+        } timed{quiesceStats, shareStart};
         quiesceForConversion();
         cut(base);
         cut(base + pageBytes);
@@ -900,10 +1060,11 @@ private:
         invalidate(*view.page);
     }
 
-    void evict(std::map<std::uintptr_t, Run>::iterator run) {
+    void evict(std::map<std::uintptr_t, Run>::iterator run, bool live = true) {
         const auto start = run->first;
         const auto stop = run->second.end;
-        quiesceForConversion();
+        // A run the guest is unmapping (reset) is not used by guest code meanwhile: no quiesce.
+        if (live) quiesceForConversion();
         note(6, start, stop);
         disarm(start, stop);
         DWORD previous;
@@ -1054,6 +1215,17 @@ private:
         if (memory.RegionSize != bytes && !VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split guest placeholder suffix");
     }
 
+    bool sameMapping(std::uintptr_t address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) const {
+        if (bytes == 0 || address % pageBytes != 0 || bytes % pageBytes != 0) return false;
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            const auto view = views.find(address + done);
+            if (view == views.end() || view->second.protection != protection) return false;
+            const auto slot = physical.find(std::make_pair(reinterpret_cast<std::uintptr_t>(section), offset + done));
+            if (slot == physical.end() || view->second.slot != &slot->second) return false;
+        }
+        return true;
+    }
+
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
         forgetClean(address, end);
@@ -1082,7 +1254,7 @@ private:
                     views.erase(found);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
-                if (const auto run = residentRuns.find(cursor); run != residentRuns.end()) evict(run);
+                if (const auto run = residentRuns.find(cursor); run != residentRuns.end()) evict(run, false);
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
             } else {
                 throw std::runtime_error("unsupported guest mapping type");

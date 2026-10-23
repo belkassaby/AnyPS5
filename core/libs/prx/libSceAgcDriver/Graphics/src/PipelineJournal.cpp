@@ -905,8 +905,14 @@ std::uint64_t validTail(const std::filesystem::path& path, std::uint64_t from, s
     if (!file) return from;
     file.seekg(static_cast<std::streamoff>(from));
     std::vector<std::byte> bytes(static_cast<std::size_t>(size - from));
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (static_cast<std::uint64_t>(file.gcount()) != bytes.size()) return from;
+    // In chunks, as ReadWholeFile: the C runtime refuses a read of 2 GiB or more.
+    constexpr std::size_t chunk = std::size_t{256} << 20u;
+    for (std::size_t done = 0; done < bytes.size();) {
+        const auto part = std::min(chunk, bytes.size() - done);
+        file.read(reinterpret_cast<char*>(bytes.data() + done), static_cast<std::streamsize>(part));
+        if (static_cast<std::size_t>(file.gcount()) != part) return from;
+        done += part;
+    }
     const auto span = std::span<const std::byte>(bytes);
     std::uint64_t cursor = 0;
     std::uint64_t valid = 0;
