@@ -1,6 +1,8 @@
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
 #include <cstdlib>
+#include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 #ifdef _WIN32
@@ -92,6 +94,8 @@ void SleepNanosCoarse(std::uint64_t nanos) {
 struct Waiter {
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     HANDLE timer = CreateHighResolutionTimer();
+    // Set by NotifyOne/NotifyAll before the event: the spin phase of a two-phase wait sees it.
+    std::atomic<std::uint32_t> signaled{0};
     Waiter* previous = nullptr;
     Waiter* next = nullptr;
     bool queued = false;
@@ -116,6 +120,37 @@ Waiter* ThisThreadWaiter() {
         if (slot != FLS_OUT_OF_INDEXES) FlsSetValue(slot, waiter);
     }
     return waiter;
+}
+
+// Two-phase wait (APS5_WAIT_SPIN_US, default 30; 0 blocks at once): a waiter first spins on its
+// signaled flag and only then sleeps on its event. A wake inside the window costs no kernel
+// sleep and no scheduler wake-up (tens of microseconds on Windows, more when the waking core is
+// parked or an efficiency core): PPSA01317's job and render threads hand work to each other
+// thousands of times a frame.
+std::uint64_t SpinNanos() {
+    static const std::uint64_t nanos = [] {
+        const char* text = std::getenv("APS5_WAIT_SPIN_US");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 30ull) * 1000ull;
+    }();
+    return nanos;
+}
+
+// True when the flag was raised within the spin window (or before `deadlineNanos`, if sooner);
+// the event is then consumed (it is set right after the flag).
+bool SpinForSignal(Waiter* waiter, std::uint64_t deadlineNanos) {
+    const auto budget = SpinNanos();
+    if (budget == 0) return false;
+    const auto start = NowNanos();
+    const auto until = std::min(deadlineNanos, start + budget);
+    for (std::uint32_t polls = 0;; ++polls) {
+        if (waiter->signaled.load(std::memory_order_acquire) != 0) {
+            WaitForSingleObject(waiter->event, INFINITE);
+            waiter->signaled.store(0, std::memory_order_relaxed);
+            return true;
+        }
+        YieldProcessor();
+        if ((polls & 31u) == 31u && NowNanos() >= until) return false;
+    }
 }
 
 bool EventSet(HANDLE event, DWORD milliseconds) {
@@ -169,17 +204,24 @@ void Condition::unlink(Waiter* waiter) {
 }
 
 void Condition::waitSignal(Waiter* waiter) {
+    if (SpinForSignal(waiter, std::numeric_limits<std::uint64_t>::max())) return;
     AlertableWait(1, &waiter->event, INFINITE);
+    waiter->signaled.store(0, std::memory_order_relaxed);
 }
 
 bool Condition::waitSignalUntil(Waiter* waiter, std::uint64_t deadlineNanos) {
-    if (WaitEventUntil(waiter, deadlineNanos)) return true;
+    if (SpinForSignal(waiter, deadlineNanos)) return true;
+    if (WaitEventUntil(waiter, deadlineNanos)) {
+        waiter->signaled.store(0, std::memory_order_relaxed);
+        return true;
+    }
     std::lock_guard lock(queueLock);
     if (waiter->queued) {
         unlink(waiter);
         return false;
     }
-    WaitForSingleObject(waiter->event, 0);
+    WaitForSingleObject(waiter->event, INFINITE);
+    waiter->signaled.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -192,6 +234,7 @@ void Condition::NotifyOne() {
     Waiter* waiter = head;
     if (!waiter) return;
     unlink(waiter);
+    waiter->signaled.store(1, std::memory_order_release);
     SetEvent(waiter->event);
 }
 
@@ -203,6 +246,7 @@ void Condition::NotifyAll() {
     std::lock_guard lock(queueLock);
     while (Waiter* waiter = head) {
         unlink(waiter);
+        waiter->signaled.store(1, std::memory_order_release);
         SetEvent(waiter->event);
     }
 }

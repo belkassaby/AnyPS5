@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/HostThreads.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -146,6 +147,7 @@ void Driver::runCompletionThread() noexcept {
 }
 
 void Driver::run(std::uint32_t id) noexcept {
+    AgcDriver::JoinGamesSchedulingClass();
     onWorkerThread() = true;
     {
         char role[32];

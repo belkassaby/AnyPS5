@@ -30,6 +30,7 @@ static constexpr std::size_t THREAD_NAME_CAPACITY = 32;
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#include "prx/libkernel/System/include/HostScheduling.hpp"
 #include <limits>
 #endif
 
@@ -296,6 +297,7 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         throw std::runtime_error("scePthreadCreate: invalid Windows stack size");
     auto native = std::make_unique<NativeThreadArgs>(NativeThreadArgs{std::move(args), start.get_future(), {}});
     auto initialized = native->initialized.get_future();
+    HostScheduling::ConfigureProcessOnce();
     const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(nativeStack), StartNativeThread, native.get(), 0, nullptr);
     if (handle == 0)
         throw std::system_error(errno, std::generic_category(), "Creating guest thread");

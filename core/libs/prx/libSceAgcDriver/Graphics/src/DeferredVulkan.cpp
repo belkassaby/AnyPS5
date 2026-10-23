@@ -6,6 +6,7 @@
 // streamed (the caller's structures are on its stack). A deferred call that returns a VkResult reports
 // success; the recorder thread checks the real result and aborts on a failure, which the original
 // call would have thrown on.
+#include "prx/libSceAgcDriver/Execution/include/HostThreads.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -153,6 +154,7 @@ void PublishOpenBatch() {
 }
 
 DWORD WINAPI RecorderMain(void*) {
+    AgcDriver::JoinGamesSchedulingClass();
     auto& stream = TheStream();
     SetThreadDescription(GetCurrentThread(), L"AgcRecorder");
     for (;;) {

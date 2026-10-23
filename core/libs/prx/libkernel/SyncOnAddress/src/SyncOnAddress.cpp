@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <immintrin.h>
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
@@ -51,9 +52,35 @@ bool IsAlignedAddress(std::uintptr_t address) {
     return address != 0 && address % alignof(TValue) == 0;
 }
 
+// APS5_ADDRESS_SPIN_US (default 50): a wait first polls the address for that long, as a futex
+// waiter spins before it sleeps. PPSA01317's job system hands off ~13,000 jobs per frame through
+// these waits; a sleeping waiter took ~50 us from the wake to running, which serialized into most
+// of the frame, while 28 of 32 host threads sat idle. The value changing (the waker stores before
+// it wakes) returns as a wake would; callers re-check it, as for any futex wake. 0 sleeps at once.
+std::uint64_t AddressSpinNanos() {
+    static const std::uint64_t nanos = [] {
+        const char* text = std::getenv("APS5_ADDRESS_SPIN_US");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 50ull) * 1000ull;
+    }();
+    return nanos;
+}
+
+template <class TValue>
+bool SpinUntilChanged(TValue* address, TValue expected) {
+    const auto budget = AddressSpinNanos();
+    if (budget == 0) return false;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t polls = 0;; ++polls) {
+        if (std::atomic_ref<TValue>(*address).load(std::memory_order_acquire) != expected) return true;
+        _mm_pause();
+        if ((polls & 63u) == 63u && static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) >= budget) return false;
+    }
+}
+
 template <class TValue>
 int WaitOnAddress(TValue* address, TValue expected, const KernelUseconds* timeout, const void* caller) {
     const auto key = reinterpret_cast<std::uintptr_t>(address);
+    if ((timeout == nullptr || *timeout != 0) && SpinUntilChanged(address, expected)) return SYNC_ON_ADDRESS_OK;
     std::unique_lock<std::mutex> lock(g_waitersLock);
     if (std::atomic_ref<TValue>(*address).load() != expected) {
         return SYNC_ON_ADDRESS_OK;

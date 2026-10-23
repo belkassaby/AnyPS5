@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/HostThreads.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ReplayProbe.hpp"
@@ -435,6 +436,7 @@ void DrawPipeline::pushItem(Item item) {
 }
 
 void DrawPipeline::prepRun() {
+    AgcDriver::JoinGamesSchedulingClass();
     Active() = true;
     GuestMemory::SetCollectRole(2);
     for (;;) {
@@ -699,6 +701,7 @@ PassRunLimits passRunLimits() {
 }
 
 void DrawPipeline::run() {
+    AgcDriver::JoinGamesSchedulingClass();
     GuestMemory::SetCollectRole(1);
     Graphics::Recorder::MarkCommitterThread();
     static const auto holdBudget = [] {
