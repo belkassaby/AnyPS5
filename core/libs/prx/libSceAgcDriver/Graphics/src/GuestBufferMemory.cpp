@@ -133,6 +133,9 @@ struct HostImports {
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
+    // The bytes of `imports`, kept with every insert and erase: the import budget and the trace read
+    // it instead of summing the map (a walk over every import per new import).
+    std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -195,6 +198,7 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     state.changing();
     ++state.epoch;
+    state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
 }
 
@@ -390,8 +394,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
         return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
     }();
-    std::uint64_t live = 0;
-    for (const auto& [address, existing] : state.imports) live += existing.bytes;
+    const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.
         static std::uint64_t refused = 0, refusedBytes = 0;
@@ -489,11 +492,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
-    std::uint64_t liveBytes = bytes;
-    for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, (state.liveBytes + bytes) / 1048576.0, importedBytes / 1048576.0);
     state.changing();
-    return &state.imports.emplace(base, entry).first->second;
+    const auto inserted = state.imports.emplace(base, entry);
+    if (inserted.second) state.liveBytes += bytes;
+    return &inserted.first->second;
 }
 
 // The lease is in address order (it is built from the registry map), so a range is found by binary search.
@@ -528,6 +531,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
 #endif
         }
         state.imports.clear();
+    state.liveBytes = 0;
         state.failed.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
@@ -1257,6 +1261,7 @@ void ClearHostImports(VkDevice device) {
 #endif
     }
     state.imports.clear();
+    state.liveBytes = 0;
     state.failed.clear();
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
@@ -1706,7 +1711,20 @@ void GuestBufferMemory::AcquireRegistered() {
             lap(timing.mirrorsUs, at);
         }
     }
+    // [acquire] (APS5_PROFILE_DRAW): how many builds take the per-range pass below, and the
+    // import lookups it makes.
+    static std::atomic<std::uint64_t> acquireCalls{0}, acquirePasses{0}, acquireRanges{0}, acquireImports{0};
+    static std::atomic<std::int64_t> acquireReport{0};
+    if (profile) {
+        acquireCalls.fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = acquireReport.load(std::memory_order_relaxed);
+        if (now - last > std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count() && acquireReport.compare_exchange_strong(last, now)) {
+            std::fprintf(stderr, "[acquire] (10 s) %llu address builds, %llu took the per-range pass (%llu ranges, %llu import lookups; %zu imports live, %.1f MiB)\n", static_cast<unsigned long long>(acquireCalls.exchange(0)), static_cast<unsigned long long>(acquirePasses.exchange(0)), static_cast<unsigned long long>(acquireRanges.exchange(0)), static_cast<unsigned long long>(acquireImports.exchange(0)), Imports().imports.size(), Imports().liveBytes / 1048576.0);
+        }
+    }
     if (space == nullptr) {
+        if (profile) acquirePasses.fetch_add(1, std::memory_order_relaxed);
         // Pending GPU results in these ranges are stored when Upload prepares each region.
         lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         lap(timing.leaseUs, at);
@@ -1731,9 +1749,11 @@ void GuestBufferMemory::AcquireRegistered() {
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
+            if (profile) acquireRanges.fetch_add(1, std::memory_order_relaxed);
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
+                if (profile) acquireImports.fetch_add(1, std::memory_order_relaxed);
                 entry = importAllocation(context, state, range->address, range->bytes, lease);
             }
             lap(timing.importsUs, at);
