@@ -96,10 +96,28 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
     return key;
 }
 
+// Leaves new elements uninitialized: a texture snapshot is overwritten whole by ReadTextureSurface,
+// and zeroing it first (often megabytes per cache miss) cost the committer a sixth of its time.
+template<typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+    template<typename U>
+    struct rebind {
+        using other = DefaultInitAllocator<U>;
+    };
+    DefaultInitAllocator() = default;
+    template<typename U>
+    DefaultInitAllocator(const DefaultInitAllocator<U>&) noexcept {}
+    template<typename U>
+    void construct(U* pointer) noexcept(std::is_nothrow_default_constructible_v<U>) { ::new (static_cast<void*>(pointer)) U; }
+    template<typename U, typename... Args>
+    void construct(U* pointer, Args&&... args) { std::allocator_traits<std::allocator<T>>::construct(static_cast<std::allocator<T>&>(*this), pointer, std::forward<Args>(args)...); }
+};
+using SnapshotBytes = std::vector<std::byte, DefaultInitAllocator<std::byte>>;
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
-    std::vector<std::byte> bytes;
+    SnapshotBytes bytes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
     DccKeys keys = DccKeys::Uncompressed;
@@ -463,7 +481,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         eraseTexture(cache, it);
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, SnapshotBytes(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     entry.accounted = guestBytes;
     if (source != nullptr) {
         entry.source = source;
@@ -473,6 +491,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+        // A clear fill may leave bytes unwritten (an unknown layout, a partial element): zero first.
+        if (*keys != DccKeys::Uncompressed) std::fill(entry.bytes.begin(), entry.bytes.end(), std::byte{0});
         ReadTextureSurface(resource, *keys, entry.bytes);
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -5214,7 +5234,12 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     static const bool dedupeSpaceReads = std::getenv("APS5_NO_READ_SET_DEDUPE") == nullptr;
     const auto readKind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
     if (const auto spaceSerial = dedupeSpaceReads ? guestMemory.AddressSpaceSerial() : 0; spaceSerial != 0) {
-        if (!recorder.ReadSetNoted(spaceSerial)) recorder.NotePendingReads(guestMemory.AddressSpaceReads(), readKind);
+        // APS5_NO_SHARED_READS=1 copies the space's ranges into each batch, as before.
+        static const bool sharedReads = std::getenv("APS5_NO_SHARED_READS") == nullptr;
+        if (!recorder.ReadSetNoted(spaceSerial)) {
+            if (auto set = sharedReads ? guestMemory.AddressSpaceReadSet() : nullptr) recorder.NoteSharedReads(std::move(set), readKind);
+            else recorder.NotePendingReads(guestMemory.AddressSpaceReads(), readKind);
+        }
         recorder.NotePendingReads(guestMemory.OwnInPlaceReads(), readKind);
     } else {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), readKind);

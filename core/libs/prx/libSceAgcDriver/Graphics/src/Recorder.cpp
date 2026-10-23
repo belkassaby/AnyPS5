@@ -3972,6 +3972,21 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
+void Recorder::NoteSharedReads(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> sorted, ReadKind kind) {
+    if (sorted == nullptr) return;
+    if (auto* log = ForkLogged()) {
+        log->Defer(ForkLog::Effect::Reads, 0, sorted->size(), [this, sorted, kind] { NoteSharedReads(sorted, kind); });
+        return;
+    }
+    if (auto* witness = ForkWitnessed()) witness->Note(ForkLog::Effect::Reads, 0, sorted->size());
+    if (sorted->empty() || !ReadTrackingEnabled()) return;
+    ensureOpen();
+    const Batch::Read bounds{sorted->front().first, sorted->back().second, kind};
+    const auto count = sorted->size();
+    open->sharedReads.push_back({std::move(sorted), bounds});
+    readsNoted.fetch_add(count, std::memory_order_relaxed);
+}
+
 bool Recorder::ReadSetNoted(std::uint64_t serial) {
     ForkTrap("read set");
     if (serial == 0 || !ReadTrackingEnabled()) return false;
@@ -3984,6 +3999,14 @@ bool Recorder::ReadSetNoted(std::uint64_t serial) {
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
     for (const auto& read : batch.reads) {
         if (address < read.end && read.begin < end) return &read;
+    }
+    for (const auto& shared : batch.sharedReads) {
+        if (end <= shared.bounds.begin || shared.bounds.end <= address) continue;
+        const auto& ranges = *shared.ranges;
+        // The first range beginning past `address`; the one before it may still cover `address`.
+        auto at = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.first; });
+        if (at != ranges.begin() && address < std::prev(at)->second) return &shared.bounds;
+        if (at != ranges.end() && at->first < end) return &shared.bounds;
     }
     return nullptr;
 }
@@ -4357,6 +4380,9 @@ void Recorder::Submit() {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
+        for (const auto& shared : open->sharedReads) {
+            for (const auto& [begin, end] : *shared.ranges) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
+        }
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
@@ -5072,6 +5098,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.reads.clear();
         if (FlipReadCheck()) {
             for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
+            for (const auto& shared : batch->sharedReads) entry.reads.insert(entry.reads.end(), shared.ranges->begin(), shared.ranges->end());
         }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.

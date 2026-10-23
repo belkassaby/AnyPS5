@@ -359,6 +359,9 @@ public:
     // and the regions of this build outside it.
     std::uint64_t AddressSpaceSerial() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> AddressSpaceReads() const;
+    // The same in-place regions, built once per space, sorted and disjoint (Recorder::NoteSharedReads);
+    // null when the space's regions are not disjoint (AddressSpaceReads then).
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> AddressSpaceReadSet() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> OwnInPlaceReads() const;
     bool SpaceOnly() const { return uploaded && !committed && space != nullptr && regions.empty() && lease.empty(); }
     enum class SpaceShare : std::uint8_t { Taken, Replaced, Imports };

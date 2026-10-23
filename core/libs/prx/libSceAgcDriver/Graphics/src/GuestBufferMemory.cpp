@@ -89,6 +89,10 @@ struct GuestBufferMemory::AddressSpace {
     GuestAllocations::Lease lease;
     std::vector<Region> base;
     bool baseDisjoint = false;
+    // Built with the space: the in-place regions of `base` (for NoteSharedReads) and the indices of
+    // its mirrored regions, so a build need not walk every region.
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
+    std::vector<std::uint32_t> mirrored;
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
@@ -1702,8 +1706,8 @@ void GuestBufferMemory::AcquireRegistered() {
             // an existing mirror. The preparation may wait for recorded work, whose completions can
             // retire an import the space's regions point at: UploadFinish re-checks the epoch
             // before any of them is dereferenced.
-            for (const auto& region : space->base) {
-                if (region.mirror == nullptr) continue;
+            for (const auto index : space->mirrored) {
+                const auto& region = space->base[index];
                 mirrored = true;
                 if (region.mirror->heap) heaps.push_back(region.mirror.get());
                 else if (region.mirror->writable && prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
@@ -1834,6 +1838,13 @@ void GuestBufferMemory::AcquireRegistered() {
                 regions = std::move(extras);
                 lease.clear();
                 built->baseDisjoint = std::adjacent_find(built->base.begin(), built->base.end(), [](const Region& left, const Region& right) { return right.begin < left.end; }) == built->base.end();
+                auto directReads = std::make_shared<std::vector<std::pair<std::uint64_t, std::uint64_t>>>();
+                for (std::size_t index = 0; index < built->base.size(); ++index) {
+                    const auto& region = built->base[index];
+                    if (region.direct != nullptr) directReads->emplace_back(region.begin, region.end);
+                    if (region.mirror != nullptr) built->mirrored.push_back(static_cast<std::uint32_t>(index));
+                }
+                built->directReads = std::move(directReads);
                 space = std::move(built);
                 spaces.droppedByWaiter.store(false, std::memory_order_relaxed);
                 spaces.current.store(space);
@@ -1876,8 +1887,8 @@ GuestBufferMemory::SpaceShare GuestBufferMemory::ShareSpace(std::uint64_t serial
     prepared = true;
     std::vector<RefreshBlock> blocks;
     std::vector<ImageMirror*> heaps;
-    for (const auto& region : space->base) {
-        if (region.mirror == nullptr) continue;
+    for (const auto index : space->mirrored) {
+        const auto& region = space->base[index];
         if (region.mirror->heap) heaps.push_back(region.mirror.get());
         else if (region.mirror->writable && prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
     }
@@ -3399,13 +3410,13 @@ std::uint64_t GuestBufferMemory::AddressSpaceSerial() const {
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::AddressSpaceReads() const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed || space == nullptr) return result;
-    result.reserve(space->base.size());
-    for (const auto& region : space->base) {
-        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
-    }
-    return result;
+    if (!uploaded || committed || space == nullptr || space->directReads == nullptr) return {};
+    return *space->directReads;
+}
+
+std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::AddressSpaceReadSet() const {
+    if (!uploaded || committed || space == nullptr || !space->baseDisjoint) return nullptr;
+    return space->directReads;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::OwnInPlaceReads() const {

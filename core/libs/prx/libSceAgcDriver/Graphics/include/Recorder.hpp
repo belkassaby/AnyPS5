@@ -239,6 +239,9 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    // As NotePendingReads for a large, shared set of sorted and disjoint ranges (an address space's
+    // in-place reads): the batch keeps a reference and searches it instead of copying the ranges.
+    void NoteSharedReads(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> sorted, ReadKind kind);
     // Whether the open batch (opened now if needed) already noted the read set `serial` (an
     // address space's leased regions, identical for every build sharing it); marks it noted. The
     // caller notes the set's ranges only on false. Always false with read tracking off.
@@ -821,6 +824,13 @@ private:
         };
         std::vector<Read> reads;
         std::vector<std::uint64_t> readSets;
+        // Shared read sets (NoteSharedReads), sorted and disjoint; `bounds` spans the set and carries
+        // its kind (what readOverlap returns for a hit inside it).
+        struct SharedReads {
+            std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges;
+            Read bounds;
+        };
+        std::vector<SharedReads> sharedReads;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         bool submitted = false;
