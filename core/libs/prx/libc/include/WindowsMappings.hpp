@@ -3,6 +3,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -20,6 +22,102 @@
 #include <system_error>
 
 namespace GuestArena {
+
+// Suspends, for its lifetime, the other threads of this process that are executing guest code
+// (app.exe or a relinked *.guest.prx). Converting resident guest memory in place (cut, share, evict)
+// releases and recommits pages that guest threads may be using: one touching them meanwhile takes an
+// access fault, and Windows dispatches it on that thread's stack, writing its exception frame over the
+// 128 bytes below rsp that SysV guest code keeps locals in (PPSA01317's BVH jobs then read a clobbered
+// pointer). A thread running guest code holds no emulator lock, so suspending it cannot deadlock the
+// conversion; threads inside the emulator or the OS are resumed at once. No heap is used.
+// APS5_NO_GUEST_QUIESCE=1 turns it off.
+class GuestQuiesce {
+public:
+    GuestQuiesce() {
+        static const bool enabled = std::getenv("APS5_NO_GUEST_QUIESCE") == nullptr;
+        if (!enabled) return;
+        collectRanges();
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return;
+        const auto process = GetCurrentProcessId();
+        const auto self = GetCurrentThreadId();
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (BOOL more = Thread32First(snapshot, &entry); more && count < MaxThreads; more = Thread32Next(snapshot, &entry)) {
+            if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+            const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+            if (thread == nullptr) continue;
+            if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+                CloseHandle(thread);
+                continue;
+            }
+            // GetThreadContext also waits until the suspension has taken effect.
+            context.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(thread, &context) && inGuest(context.Rip)) {
+                held[count++] = thread;
+                continue;
+            }
+            ResumeThread(thread);
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        heldTotal().fetch_add(count, std::memory_order_relaxed);
+        quiesces().fetch_add(1, std::memory_order_relaxed);
+    }
+    GuestQuiesce(const GuestQuiesce&) = delete;
+    GuestQuiesce& operator=(const GuestQuiesce&) = delete;
+    ~GuestQuiesce() {
+        for (std::size_t i = 0; i < count; ++i) {
+            ResumeThread(held[i]);
+            CloseHandle(held[i]);
+        }
+    }
+    static std::atomic<std::uint64_t>& quiesces() {
+        static std::atomic<std::uint64_t> value{0};
+        return value;
+    }
+    static std::atomic<std::uint64_t>& heldTotal() {
+        static std::atomic<std::uint64_t> value{0};
+        return value;
+    }
+
+private:
+    static constexpr std::size_t MaxThreads = 1024;
+    static constexpr std::size_t MaxRanges = 64;
+    struct Range {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+    };
+
+    void collectRanges() {
+        HMODULE modules[1024];
+        DWORD needed = 0;
+        if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return;
+        const auto total = std::min<std::size_t>(needed / sizeof(HMODULE), std::size(modules));
+        const HMODULE executable = GetModuleHandleW(nullptr);
+        for (std::size_t i = 0; i < total && rangeCount < MaxRanges; ++i) {
+            char name[MAX_PATH] = {};
+            if (modules[i] != executable && (K32GetModuleBaseNameA(GetCurrentProcess(), modules[i], name, sizeof(name)) == 0 || std::strstr(name, ".guest.") == nullptr)) continue;
+            MODULEINFO info{};
+            if (!K32GetModuleInformation(GetCurrentProcess(), modules[i], &info, sizeof(info))) continue;
+            const auto begin = reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll);
+            ranges[rangeCount++] = {begin, begin + info.SizeOfImage};
+        }
+    }
+
+    bool inGuest(std::uint64_t rip) const {
+        for (std::size_t i = 0; i < rangeCount; ++i) {
+            if (rip >= ranges[i].begin && rip < ranges[i].end) return true;
+        }
+        return false;
+    }
+
+    alignas(16) CONTEXT context{};
+    HANDLE held[MaxThreads];
+    std::size_t count = 0;
+    Range ranges[MaxRanges];
+    std::size_t rangeCount = 0;
+};
 
 class WindowsMappings {
 public:
@@ -73,11 +171,13 @@ public:
 
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ConversionScope conversion(*this);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched) {
         std::lock_guard lock(mutex);
+        ConversionScope conversion(*this);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         watchResident = watched;
@@ -251,6 +351,7 @@ public:
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ConversionScope conversion(*this);
         const auto refuse = [&](const char* reason) {
             char text[192];
             std::snprintf(text, sizeof(text), "read-write alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
@@ -689,6 +790,29 @@ private:
         return true;
     }
 
+
+    // Open around an entry point that may convert resident memory; the guest threads are suspended
+    // (GuestQuiesce) by the first conversion inside it and resumed when it closes.
+    struct ConversionScope {
+        explicit ConversionScope(WindowsMappings& owner) : owner(owner), outer(owner.conversionScope) { owner.conversionScope = this; }
+        ConversionScope(const ConversionScope&) = delete;
+        ConversionScope& operator=(const ConversionScope&) = delete;
+        ~ConversionScope() {
+            owner.conversionScope = outer;
+            delete quiesce;
+        }
+        WindowsMappings& owner;
+        ConversionScope* outer;
+        GuestQuiesce* quiesce = nullptr;
+    };
+    ConversionScope* conversionScope = nullptr;
+    void quiesceForConversion() {
+        // The outermost open scope holds the suspension (the GuestQuiesce is new'd before any
+        // thread is suspended, so the heap is free then).
+        auto* scope = conversionScope;
+        while (scope != nullptr && scope->outer != nullptr) scope = scope->outer;
+        if (scope != nullptr && scope->quiesce == nullptr) scope->quiesce = new GuestQuiesce;
+    }
     void cut(std::uintptr_t at) {
         auto it = residentRuns.upper_bound(at);
         if (it == residentRuns.begin()) return;
@@ -696,6 +820,7 @@ private:
         const auto start = it->first;
         const auto stop = it->second.end;
         if (at <= start || at >= stop) return;
+        quiesceForConversion();
         note(4, start, stop);
         disarm(start, stop);
         DWORD previous;
@@ -716,6 +841,7 @@ private:
     }
 
     void share(std::uintptr_t base) {
+        quiesceForConversion();
         cut(base);
         cut(base + pageBytes);
         note(5, base, base + pageBytes);
@@ -739,6 +865,7 @@ private:
     void evict(std::map<std::uintptr_t, Run>::iterator run) {
         const auto start = run->first;
         const auto stop = run->second.end;
+        quiesceForConversion();
         note(6, start, stop);
         disarm(start, stop);
         DWORD previous;
