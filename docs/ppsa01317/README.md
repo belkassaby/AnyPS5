@@ -63,6 +63,12 @@ $env:APS5_RT_SLICE_LAYERS = '1'
 
 The window title shows the current FPS.
 
+## Shader precompilation and graphics settings
+
+- `APS5_PRECOMPILE=1` holds the title at its first GPU submission until the shader warm list and the pipeline journal have been replayed on all cores (normal priority, no yielding). Every shader and pipeline an earlier session met is then built before the first frame instead of stalling a draw. On an i9-13900HX with an RTX 4090-class GPU that took 71 s for 13,229 variants, 21,445 modules and 2,242 pipelines. `[precompile]` lines in `run-err.log` report the progress. `APS5_PRECOMPILE_MAX_S` bounds the wait (1800 s by default).
+- `APS5_PRESENT_FILTER=nearest` scales the frame to the window without filtering.
+- `gt7-settings.ps1` is a small dialog with presets for resolution (`APS5_OPERATION_SUBMODE`), presentation mode, 120 Hz output, precompilation, geometry in VRAM, the image pool, the host-import budget and the working set. It writes `graphics-settings.json` next to the launcher, which applies it as environment defaults. DLSS is listed but disabled, because it needs the title's motion vectors, which the port does not extract yet.
+
 ## Notes
 
 - The first boot compiles shaders and is slow. FPS settles after a couple of minutes on the World Map, and later boots start warm from the saved pipeline cache.

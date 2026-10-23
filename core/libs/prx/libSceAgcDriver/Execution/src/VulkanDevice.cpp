@@ -1624,6 +1624,12 @@ void VulkanDevice::WaitForPipelineJournalReplay() {
     if (replay != nullptr) replay->Wait();
 }
 
+VulkanDevice::JournalReplayState VulkanDevice::PipelineJournalReplayState() const {
+    if (state->journalReplayPending.load(std::memory_order_acquire)) return JournalReplayState::NotStarted;
+    std::lock_guard lock(state->journalReplayMutex);
+    return state->journalReplay == nullptr || state->journalReplay->Done() ? JournalReplayState::Done : JournalReplayState::Running;
+}
+
 std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
     return state->computePipelinesCreated.load(std::memory_order_relaxed);
 }

@@ -738,11 +738,21 @@ void StartShaderWarmList(const VulkanDevice& device) {
         ShaderRecompiler::WarmList::ReplayOptions options;
         const char* threads = std::getenv("APS5_SHADER_WARM_THREADS");
         const auto requested = threads != nullptr ? static_cast<unsigned>(std::strtoul(threads, nullptr, 10)) : 0u;
-        options.threads = requested != 0 ? std::min(requested, 16u) : std::clamp(std::thread::hardware_concurrency() / 6u, 1u, 4u);
-        options.waitTurn = [] {
-            while (!RegistrationPreparePool::Instance().IdleFor(1000)) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            return true;
-        };
+        // APS5_PRECOMPILE=1: the title waits at its first submission until the replay is done
+        // (Driver::Submit), so the replay takes most of the cores at normal priority and never yields.
+        const char* precompileValue = std::getenv("APS5_PRECOMPILE");
+        const bool precompile = precompileValue != nullptr && std::strcmp(precompileValue, "0") != 0;
+        const auto cores = std::max(1u, std::thread::hardware_concurrency());
+        options.threads = requested != 0 ? std::min(requested, 32u) : precompile ? std::clamp(cores - 2u, 2u, 32u) : std::clamp(cores / 6u, 1u, 4u);
+        if (precompile) {
+            options.lowPriority = false;
+            options.waitTurn = [] { return true; };
+        } else {
+            options.waitTurn = [] {
+                while (!RegistrationPreparePool::Instance().IdleFor(1000)) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                return true;
+            };
+        }
         try {
             options.target = device.Target();
         } catch (const std::exception&) {

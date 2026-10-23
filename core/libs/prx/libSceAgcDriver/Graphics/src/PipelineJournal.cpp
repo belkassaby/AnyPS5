@@ -1530,7 +1530,11 @@ std::shared_ptr<PipelineJournalReplay> StartPipelineJournalReplay(const Context&
     if (!Journal::Instance().Enabled() || !Journal::Instance().Bind(deviceFingerprint)) return nullptr;
     // Few threads: the replay is background work that yields to the title (ReplayGate), not a race
     // to finish before the title's first use.
-    const auto threads = static_cast<unsigned>(configured("APS5_PIPELINE_JOURNAL_THREADS", 2u));
+    // APS5_PRECOMPILE=1 holds the title until the replay is done, so it takes most of the cores.
+    const char* precompile = std::getenv("APS5_PRECOMPILE");
+    const auto cores = std::max(1u, std::thread::hardware_concurrency());
+    const auto fallback = precompile != nullptr && std::strcmp(precompile, "0") != 0 ? std::clamp(cores - 2u, 2u, 32u) : 2u;
+    const auto threads = static_cast<unsigned>(configured("APS5_PIPELINE_JOURNAL_THREADS", fallback));
     if (threads == 0) return nullptr;
     return std::make_shared<Replay>(context, std::move(hooks), threads);
 }

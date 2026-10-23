@@ -8,9 +8,16 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "ThreadOwned.hpp"
+#include "ShaderWarmList.hpp"
 #include <bit>
 #include <optional>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <cstring>
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #ifdef _WIN32
 #include <windows.h>
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
@@ -238,7 +245,60 @@ void Driver::executeRewindTail(const Submission& stalled) {
     execute(tail);
 }
 
+namespace {
+
+// APS5_PRECOMPILE=1: the title's submissions wait until the shader warm list and the pipeline
+// journal have been replayed, so every shader and pipeline an earlier session met is built before
+// the first frame instead of stalling a draw. The submitting thread holds no driver lock here. A
+// device that has not started its journal replay yet (headless until it takes the window) does
+// not hold the title: later submissions check again. APS5_PRECOMPILE_MAX_S bounds the wait
+// (1800 s by default).
+void WaitForPrecompile(const std::shared_ptr<VulkanDevice>& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PRECOMPILE");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    static std::atomic<bool> passed{false};
+    if (!enabled || passed.load(std::memory_order_acquire)) return;
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    if (passed.load(std::memory_order_acquire)) return;
+    static const auto started = std::chrono::steady_clock::now();
+    static const double limit = [] {
+        const char* value = std::getenv("APS5_PRECOMPILE_MAX_S");
+        return value != nullptr ? std::strtod(value, nullptr) : 1800.0;
+    }();
+    static auto lastReport = std::chrono::steady_clock::time_point{};
+    using JournalState = VulkanDevice::JournalReplayState;
+    for (;;) {
+        const auto warm = ShaderRecompiler::WarmList::Totals();
+        const bool warmDone = !warm.started || warm.replayDone;
+        const auto journal = device != nullptr ? device->PipelineJournalReplayState() : JournalState::NotStarted;
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - started).count();
+        const bool finished = warmDone && journal == JournalState::Done;
+        if (finished || seconds >= limit) {
+            std::fprintf(stderr, finished ? "[precompile] done in %.1f s; the title runs\n" : "[precompile] gave up after %.1f s; the title runs\n", seconds);
+            passed.store(true, std::memory_order_release);
+            return;
+        }
+        if (now - lastReport >= std::chrono::seconds(5)) {
+            lastReport = now;
+            std::fprintf(stderr, "[precompile] %.0f s: shader variants %llu/%llu, modules %llu/%llu%s; pipeline journal %s\n", seconds,
+                         static_cast<unsigned long long>(warm.replayedVariants), static_cast<unsigned long long>(warm.loadedVariants),
+                         static_cast<unsigned long long>(warm.replayedModules), static_cast<unsigned long long>(warm.loadedModules),
+                         warmDone ? " (done)" : "", journal == JournalState::NotStarted ? "not started" : "replaying");
+        }
+        if (warmDone && journal == JournalState::NotStarted) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+
+}
+
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
+    WaitForPrecompile(device.Load());
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     const auto traceEntry = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 #ifdef _WIN32
