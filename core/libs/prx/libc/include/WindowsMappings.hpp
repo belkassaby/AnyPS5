@@ -642,6 +642,29 @@ public:
                 // BVH jobs then read a clobbered pointer (app.exe+0x169a7b8) after a fault in the
                 // same frame.
                 static const bool noArmShared = std::getenv("APS5_NO_ARM_SHARED") != nullptr;
+                // APS5_HASH_SHARED=1: shared pages are not write-protected either (no tracking
+                // faults, so no red-zone clobbering), but a collect reports a page written only when
+                // a host write moved its generation or its content hash differs from the one taken
+                // when it was last consumed, so unchanged pages are not uploaded again.
+                static const bool hashShared = std::getenv("APS5_HASH_SHARED") != nullptr;
+                if (hashShared && view.page->pins == 0) {
+                    const auto hash = HashPage(base);
+                    if (!view.hashed || hash != view.contentHash || view.seen != view.page->generation) {
+                        const auto needed = (stop - cursor + 4095) / 4096;
+                        if (needed > capacity - *count) {
+                            for (auto at = cursor; *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
+                            return true;
+                        }
+                        for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
+                    }
+                    if (clear) {
+                        view.contentHash = hash;
+                        view.hashed = true;
+                        view.seen = view.page->generation;
+                    }
+                    cursor = stop;
+                    continue;
+                }
                 const bool pinned = view.page->pins != 0 || noArmShared;
                 if (pinned || view.seen != view.page->generation) {
                     const auto needed = (stop - cursor + 4095) / 4096;
@@ -732,7 +755,22 @@ private:
         Physical* slot;
         std::uint8_t cleanStreak = 0;
         std::uint8_t armAfter = InitialArmAfter();
+        // APS5_HASH_SHARED: the page's content when it was last consumed (hashed = taken).
+        std::uint64_t contentHash = 0;
+        bool hashed = false;
     };
+    // A 64-bit hash of one guest page, four independent lanes so it runs near memory speed.
+    static std::uint64_t HashPage(std::uintptr_t base) {
+        const auto* words = reinterpret_cast<const std::uint64_t*>(base);
+        std::uint64_t lanes[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full, 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+        for (std::size_t i = 0; i < pageBytes / sizeof(std::uint64_t); i += 4) {
+            for (std::size_t lane = 0; lane < 4; ++lane) {
+                lanes[lane] = (lanes[lane] ^ words[i + lane]) * 0x100000001b3ull;
+                lanes[lane] ^= lanes[lane] >> 29;
+            }
+        }
+        return lanes[0] ^ (lanes[1] * 3u) ^ (lanes[2] * 5u) ^ (lanes[3] * 7u);
+    }
     static std::uint8_t InitialArmAfter() {
         static const std::uint8_t value = [] {
             const char* text = std::getenv("APS5_ARM_AFTER");
