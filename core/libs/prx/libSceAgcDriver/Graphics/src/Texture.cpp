@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <list>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -346,6 +347,136 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
 
 }
 
+
+namespace ImagePool {
+namespace {
+
+struct Pooled {
+    Context context;
+    std::uint64_t key;
+    VkImage image;
+    VkDeviceMemory memory;
+    VkDeviceSize bytes;
+};
+
+struct State {
+    std::mutex mutex;
+    // Most recently given first; evicted from the back past the byte cap.
+    std::list<Pooled> entries;
+    std::unordered_multimap<std::uint64_t, std::list<Pooled>::iterator> byKey;
+    VkDeviceSize bytes = 0;
+    std::uint64_t takes = 0, misses = 0, gives = 0, evictions = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+State& Pool() {
+    static auto* state = new State;
+    return *state;
+}
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_NO_IMAGE_POOL") == nullptr;
+    return enabled;
+}
+
+VkDeviceSize CapBytes() {
+    static const VkDeviceSize cap = [] {
+        const char* text = std::getenv("APS5_IMAGE_POOL_MIB");
+        return static_cast<VkDeviceSize>(text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) << 20u;
+    }();
+    return cap;
+}
+
+void Destroy(const Pooled& entry) {
+    entry.context.Function<PFN_vkDestroyImage>("vkDestroyImage")(entry.context.device, entry.image, nullptr);
+    entry.context.Function<PFN_vkFreeMemory>("vkFreeMemory")(entry.context.device, entry.memory, nullptr);
+}
+
+void Report(State& state) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || std::chrono::steady_clock::now() - state.lastReport < std::chrono::seconds(10)) return;
+    state.lastReport = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[image-pool] (10 s) %llu taken, %llu missed, %llu given, %llu evicted; %zu held (%.1f MiB)\n", static_cast<unsigned long long>(state.takes), static_cast<unsigned long long>(state.misses), static_cast<unsigned long long>(state.gives), static_cast<unsigned long long>(state.evictions), state.entries.size(), state.bytes / 1048576.0);
+    state.takes = state.misses = state.gives = state.evictions = 0;
+}
+
+}
+
+std::uint64_t Key(VkDevice device, const VkImageCreateInfo& info) {
+    if (!Enabled() || info.pNext != nullptr) return 0;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    mix(reinterpret_cast<std::uintptr_t>(device));
+    mix(info.flags);
+    mix(info.imageType);
+    mix(info.format);
+    mix(info.extent.width);
+    mix(info.extent.height);
+    mix(info.extent.depth);
+    mix(info.mipLevels);
+    mix(info.arrayLayers);
+    mix(info.samples);
+    mix(info.tiling);
+    mix(info.usage);
+    mix(info.sharingMode);
+    return hash == 0 ? 1 : hash;
+}
+
+bool Take(VkDevice device, std::uint64_t key, VkImage& image, VkDeviceMemory& memory, VkDeviceSize& bytes) {
+    if (key == 0) return false;
+    auto& state = Pool();
+    std::lock_guard lock(state.mutex);
+    Report(state);
+    const auto found = state.byKey.find(key);
+    if (found == state.byKey.end() || found->second->context.device != device) {
+        ++state.misses;
+        return false;
+    }
+    const auto entry = found->second;
+    image = entry->image;
+    memory = entry->memory;
+    bytes = entry->bytes;
+    state.bytes -= entry->bytes;
+    state.byKey.erase(found);
+    state.entries.erase(entry);
+    ++state.takes;
+    return true;
+}
+
+bool Give(const Context& context, std::uint64_t key, VkImage image, VkDeviceMemory memory, VkDeviceSize bytes) {
+    if (key == 0 || !Enabled() || bytes > CapBytes() / 4) return false;
+    auto& state = Pool();
+    std::vector<Pooled> evicted;
+    {
+        std::lock_guard lock(state.mutex);
+        state.entries.push_front({context, key, image, memory, bytes});
+        state.byKey.emplace(key, state.entries.begin());
+        state.bytes += bytes;
+        ++state.gives;
+        while (state.bytes > CapBytes() && !state.entries.empty()) {
+            auto last = std::prev(state.entries.end());
+            const auto range = state.byKey.equal_range(last->key);
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->second == last) {
+                    state.byKey.erase(it);
+                    break;
+                }
+            }
+            state.bytes -= last->bytes;
+            evicted.push_back(*last);
+            state.entries.erase(last);
+            ++state.evictions;
+        }
+    }
+    for (const auto& entry : evicted) Destroy(entry);
+    return true;
+}
+
+}
+
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -387,22 +518,32 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
-        if (AddressLedger::Enabled()) {
-            char name[112];
-            std::snprintf(name, sizeof(name), "texture 0x%llx %ux%ux%u layers %u mips %u fmt %d", static_cast<unsigned long long>(descriptor.baseAddress), imageInfo.extent.width, imageInfo.extent.height, imageInfo.extent.depth, imageInfo.arrayLayers, imageInfo.mipLevels, static_cast<int>(imageInfo.format));
-            AddressLedger::NameObject(reinterpret_cast<std::uint64_t>(image), name);
-        }
-        owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+        const auto poolKey = ImagePool::Key(context.device, imageInfo);
+        VkDeviceMemory pooledMemory = VK_NULL_HANDLE;
+        VkDeviceSize pooledBytes = 0;
+        if (ImagePool::Take(context.device, poolKey, image, pooledMemory, pooledBytes)) {
+            owned = std::make_shared<OwnedImage>(context, image, pooledMemory);
+            allocationBytes = pooledBytes;
+        } else {
+            Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
+            if (AddressLedger::Enabled()) {
+                char name[112];
+                std::snprintf(name, sizeof(name), "texture 0x%llx %ux%ux%u layers %u mips %u fmt %d", static_cast<unsigned long long>(descriptor.baseAddress), imageInfo.extent.width, imageInfo.extent.height, imageInfo.extent.depth, imageInfo.arrayLayers, imageInfo.mipLevels, static_cast<int>(imageInfo.format));
+                AddressLedger::NameObject(reinterpret_cast<std::uint64_t>(image), name);
+            }
+            owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
-        VkMemoryRequirements requirements{};
-        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
-        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocationBytes = requirements.size;
+            allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        }
+        owned->poolKey = poolKey;
+        owned->poolBytes = allocationBytes;
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip

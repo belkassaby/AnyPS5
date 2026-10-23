@@ -48,17 +48,33 @@ bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, Dc
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
+// Released sampled-texture images keyed by their create info (live `image_pool`, env
+// APS5_NO_IMAGE_POOL=1 turns it off): a texture uploaded again at the same size and format (a
+// snapshot of a surface the guest rewrote) takes one instead of vkCreateImage + vkAllocateMemory.
+// An image reaches the pool when its last holder drops it, after the batches that used it completed.
+namespace ImagePool {
+std::uint64_t Key(VkDevice device, const VkImageCreateInfo& info);
+// An image and its bound memory made for `key`, or false.
+bool Take(VkDevice device, std::uint64_t key, VkImage& image, VkDeviceMemory& memory, VkDeviceSize& bytes);
+// Keeps the image for a later Take; false when the pool is full or off (the caller destroys it).
+bool Give(const Context& context, std::uint64_t key, VkImage image, VkDeviceMemory memory, VkDeviceSize bytes);
+}
+
 struct OwnedImage {
     OwnedImage(const Context& context, VkImage image, VkDeviceMemory memory) : context(context), image(image), memory(memory) {}
     OwnedImage(const OwnedImage&) = delete;
     OwnedImage& operator=(const OwnedImage&) = delete;
     ~OwnedImage() {
+        if (poolKey != 0 && image && memory && ImagePool::Give(context, poolKey, image, memory, poolBytes)) return;
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
     }
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    // Set for images that may return to the ImagePool (0: destroyed when released).
+    std::uint64_t poolKey = 0;
+    VkDeviceSize poolBytes = 0;
 };
 
 class Texture {
