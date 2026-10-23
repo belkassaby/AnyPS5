@@ -180,6 +180,10 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
 struct TextureCounters {
     std::atomic<std::uint64_t> fromStorage{0};
     std::atomic<std::uint64_t> snapshots{0};
+    // Why a sampled lookup made a new texture: no entry, a storage view that no longer serves, an
+    // entry of the other kind (view vs snapshot, size, keys), or a snapshot whose memory changed;
+    // and the bytes the new snapshots read.
+    std::atomic<std::uint64_t> missNone{0}, missView{0}, missKind{0}, missChanged{0}, snapshotBytes{0}, budgetEvictions{0};
     std::atomic<std::uint64_t> pendingReads{0};
     std::atomic<std::uint64_t> storageFallbacks{0};
     std::atomic<std::uint64_t> records{0};
@@ -207,6 +211,7 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] new sampled textures by cause: no entry %llu, view no longer serves %llu, other kind %llu, snapshot changed %llu; snapshots read %.1f MiB; %llu evicted by the budget\n", count(counters.missNone), count(counters.missView), count(counters.missKind), count(counters.missChanged), static_cast<double>(counters.snapshotBytes.load(std::memory_order_relaxed)) / 1048576.0, count(counters.budgetEvictions));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -431,8 +436,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
+    auto& missCounters = TextureCounts();
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
+            missCounters.missView.fetch_add(1, std::memory_order_relaxed);
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
@@ -448,9 +455,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
+                missCounters.missView.fetch_sub(1, std::memory_order_relaxed);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source != nullptr || it->bytes.size() != guestBytes || it->keys != *keys) {
+            missCounters.missKind.fetch_add(1, std::memory_order_relaxed);
+        } else {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -478,8 +488,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
+            missCounters.missChanged.fetch_add(1, std::memory_order_relaxed);
         }
         eraseTexture(cache, it);
+    } else {
+        missCounters.missNone.fetch_add(1, std::memory_order_relaxed);
     }
     CachedTexture entry{key, address, SnapshotBytes(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     entry.accounted = guestBytes;
@@ -494,6 +507,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // A clear fill may leave bytes unwritten (an unknown layout, a partial element): zero first.
         if (*keys != DccKeys::Uncompressed) std::fill(entry.bytes.begin(), entry.bytes.end(), std::byte{0});
         ReadTextureSurface(resource, *keys, entry.bytes);
+        missCounters.snapshotBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
@@ -503,8 +517,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    constexpr std::uint64_t budget = 2048ull << 20u;
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) eraseTexture(cache, std::prev(cache.entries.end()));
+    // APS5_TEXTURE_CACHE_MIB: the guest bytes of sampled textures kept (2048 MiB by default). A working
+    // set larger than the budget is evicted and snapshotted again on every use.
+    static const std::uint64_t budget = [] {
+        const char* value = std::getenv("APS5_TEXTURE_CACHE_MIB");
+        const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        return (mib != 0 ? mib : 2048ull) << 20u;
+    }();
+    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) {
+        eraseTexture(cache, std::prev(cache.entries.end()));
+        missCounters.budgetEvictions.fetch_add(1, std::memory_order_relaxed);
+    }
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});

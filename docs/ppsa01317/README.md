@@ -67,6 +67,7 @@ The window title shows the current FPS.
 
 - `APS5_PRECOMPILE=1` holds the title at its first GPU submission until the shader warm list and the pipeline journal have been replayed on all cores (normal priority, no yielding). Every shader and pipeline an earlier session met is then built before the first frame instead of stalling a draw. On an i9-13900HX with an RTX 4090-class GPU that took 71 s for 13,229 variants, 21,445 modules and 2,242 pipelines. `[precompile]` lines in `run-err.log` report the progress. `APS5_PRECOMPILE_MAX_S` bounds the wait (1800 s by default).
 - `APS5_PRESENT_FILTER=nearest` scales the frame to the window without filtering.
+- `APS5_TEXTURE_CACHE_MIB` sets the sampled-texture cache budget (2048 by default). On licence B-1, 2 GiB evicted most textures before their next use, so they were re-read and re-uploaded every frame. 6144 cut the snapshot reads by about 6x and raised the FPS from 1.24 to 1.55 (RTX 4090 Laptop, 16 GB VRAM, 64 GB RAM). `[textures] new sampled textures by cause` reports the misses.
 - `gt7-settings.ps1` is a small dialog with presets for resolution (`APS5_OPERATION_SUBMODE`), presentation mode, 120 Hz output, precompilation, geometry in VRAM, the image pool, the host-import budget and the working set. It writes `graphics-settings.json` next to the launcher, which applies it as environment defaults. DLSS is listed but disabled, because it needs the title's motion vectors, which the port does not extract yet.
 
 ## Notes

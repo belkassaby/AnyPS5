@@ -8,9 +8,9 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 $path = Join-Path $PSScriptRoot 'graphics-settings.json'
 $presets = [ordered]@{
-    'Performance' = @{ resolution = '1080p'; presentMode = 'mailbox'; output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 2048; hostImportMiB = 12288; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
-    'Balanced'    = @{ resolution = '1080p'; presentMode = 'fifo';    output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 1024; hostImportMiB = 12288; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
-    'Quality'     = @{ resolution = '2160p'; presentMode = 'fifo';    output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 4096; hostImportMiB = 16384; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
+    'Performance' = @{ resolution = '1080p'; presentMode = 'mailbox'; output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 2048; textureCacheMiB = 6144; hostImportMiB = 12288; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
+    'Balanced'    = @{ resolution = '1080p'; presentMode = 'fifo';    output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 1024; textureCacheMiB = 4096; hostImportMiB = 12288; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
+    'Quality'     = @{ resolution = '2160p'; presentMode = 'fifo';    output120 = $false; precompile = $true; vramGeometry = $true; imagePoolMiB = 4096; textureCacheMiB = 8192; hostImportMiB = 16384; workingSetMiB = 0; upscaler = 'linear'; dlss = $false }
 }
 $settings = $presets['Performance'].Clone()
 if (Test-Path $path) {
@@ -53,6 +53,8 @@ $vramGeometry = New-Check ([bool]$settings.vramGeometry); $vramGeometry.Text = '
 Add-Row 'Geometry in VRAM' $vramGeometry 'Copies unchanged vertex and index ranges into video memory instead of reading them across PCIe on every draw.'
 $imagePool = New-Number ([int]$settings.imagePoolMiB) 16384
 Add-Row 'Texture pool (MiB)' $imagePool 'Video memory kept for reusing released images (render targets and textures) instead of reallocating them.'
+$textureCache = New-Number ([int]$settings.textureCacheMiB) 16384
+Add-Row 'Texture cache (MiB)' $textureCache "Sampled textures kept on the GPU (and their CPU snapshots) between uses. Too small, and textures are re-read and re-uploaded every frame:`n2 GiB thrashed in licence B-1; 6 GiB raised it from 1.24 to 1.55 FPS. Needs as much free RAM and VRAM."
 $hostImport = New-Number ([int]$settings.hostImportMiB) 65536
 Add-Row 'Shared guest memory (MiB)' $hostImport "How much of the game's memory the GPU may read in place (the PS5's unified memory). Lower it on GPUs with less VRAM."
 $workingSet = New-Number ([int]$settings.workingSetMiB) 65536
@@ -63,7 +65,7 @@ $preset.Add_SelectedIndexChanged({
     if (-not $p) { return }
     $resolution.SelectedItem = $p.resolution; $presentMode.SelectedItem = $p.presentMode; $upscaler.SelectedItem = $p.upscaler
     $output120.Checked = $p.output120; $precompile.Checked = $p.precompile; $vramGeometry.Checked = $p.vramGeometry
-    $imagePool.Value = $p.imagePoolMiB; $hostImport.Value = $p.hostImportMiB; $workingSet.Value = $p.workingSetMiB
+    $imagePool.Value = $p.imagePoolMiB; $textureCache.Value = $p.textureCacheMiB; $hostImport.Value = $p.hostImportMiB; $workingSet.Value = $p.workingSetMiB
 })
 
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel -Property @{ FlowDirection = 'RightToLeft'; AutoSize = $true; Dock = 'Fill'; Margin = '0,12,0,0' }
@@ -81,7 +83,7 @@ if ($result -eq 'Cancel') { return }
 [ordered]@{
     resolution = [string]$resolution.SelectedItem; upscaler = [string]$upscaler.SelectedItem; dlss = $false
     presentMode = [string]$presentMode.SelectedItem; output120 = $output120.Checked; precompile = $precompile.Checked
-    vramGeometry = $vramGeometry.Checked; imagePoolMiB = [int]$imagePool.Value; hostImportMiB = [int]$hostImport.Value; workingSetMiB = [int]$workingSet.Value
+    vramGeometry = $vramGeometry.Checked; imagePoolMiB = [int]$imagePool.Value; textureCacheMiB = [int]$textureCache.Value; hostImportMiB = [int]$hostImport.Value; workingSetMiB = [int]$workingSet.Value
 } | ConvertTo-Json | Set-Content $path -Encoding utf8
 "saved $path"
 if ($result -eq 'Yes') { Start-Process powershell -ArgumentList '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'run-gt7.ps1') -WorkingDirectory $PSScriptRoot }
